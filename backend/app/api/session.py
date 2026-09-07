@@ -10,6 +10,8 @@ from app.services.session_service import (
     update_session,
 )
 
+from app.services.red_flag_engine import detect_red_flags
+
 
 router = APIRouter(
     prefix="/api/v1/sessions",
@@ -87,3 +89,21 @@ def update_patient_session(
         )
 
     return session
+
+
+@router.get("/{session_id}/red-flags")
+def check_red_flags(session_id: str):
+    session = get_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    result = detect_red_flags(
+        complaint=session.get("chief_complaint") or "",
+        answers=session.get("answers") or {},
+    )
+
+    return result
