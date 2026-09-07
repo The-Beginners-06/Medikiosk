@@ -1,26 +1,34 @@
 from typing import Any
 from uuid import uuid4
+from datetime import datetime, timezone
 
 
 # -------------------------------------------------------------------
 # MediKiosk Patient Session Service
 # -------------------------------------------------------------------
-# This service manages the temporary patient session during
-# the clinical intake process.
+# Temporary in-memory storage for the MediKiosk MVP.
 #
-# It stores:
-# - selected language
-# - consent
-# - patient information
-# - chief complaint
-# - structured interview answers
+# Session lifecycle:
 #
-# This is currently an in-memory MVP.
-# Later, it can be connected to PostgreSQL or another database.
+# created
+#    ↓
+# consented
+#    ↓
+# interview_started
+#    ↓
+# interview_in_progress
+#    ↓
+# waiting
+#    ↓
+# in_review
+#    ↓
+# reviewed
+#
+# Later this service can be connected to PostgreSQL / ABDM-compatible
+# infrastructure.
 # -------------------------------------------------------------------
 
 
-# Temporary in-memory session storage
 SESSIONS: dict[str, dict[str, Any]] = {}
 
 
@@ -38,38 +46,30 @@ def create_session(language: str = "English") -> dict[str, Any]:
     session = {
         "session_id": session_id,
 
-        # Patient-selected language
         "language": language,
 
-        # Consent information
         "consent": {
             "granted": False,
             "purposes": [],
         },
 
-        # Basic patient information
         "patient": {
             "name": None,
             "age": None,
             "sex": None,
         },
 
-        # Main presenting complaint
         "chief_complaint": None,
 
-        # Structured clinical interview answers
-        #
-        # Example:
-        # {
-        #     "onset": "Yesterday",
-        #     "duration": "1 day",
-        #     "severity": "102°F",
-        #     "associated_symptoms": "Headache"
-        # }
         "answers": {},
 
-        # Session status
         "status": "created",
+
+        "started_at": datetime.now(timezone.utc).isoformat(),
+
+        "completed_at": None,
+
+        "reviewed_at": None,
     }
 
     SESSIONS[session_id] = session
@@ -81,7 +81,9 @@ def create_session(language: str = "English") -> dict[str, Any]:
 # GET SESSION
 # -------------------------------------------------------------------
 
-def get_session(session_id: str) -> dict[str, Any] | None:
+def get_session(
+    session_id: str,
+) -> dict[str, Any] | None:
     """
     Retrieve an existing patient session.
     """
@@ -98,7 +100,7 @@ def grant_consent(
     purposes: list[str],
 ) -> dict[str, Any] | None:
     """
-    Record patient consent for the specified purposes.
+    Record patient consent.
     """
 
     session = SESSIONS.get(session_id)
@@ -109,70 +111,10 @@ def grant_consent(
     session["consent"] = {
         "granted": True,
         "purposes": purposes,
+        "granted_at": datetime.now(timezone.utc).isoformat(),
     }
 
     session["status"] = "consented"
-
-    return session
-
-
-# -------------------------------------------------------------------
-# UPDATE SESSION
-# -------------------------------------------------------------------
-
-def update_session(
-    session_id: str,
-    chief_complaint: str | None = None,
-    field: str | None = None,
-    answer: Any = None,
-) -> dict[str, Any] | None:
-    """
-    Update information collected during the clinical intake.
-
-    The function supports two types of updates:
-
-    1. Chief complaint
-
-       chief_complaint="fever"
-
-    2. Structured interview answer
-
-       field="onset"
-       answer="Yesterday evening"
-
-    This allows the adaptive interview engine to build a
-    structured clinical history.
-    """
-
-    session = SESSIONS.get(session_id)
-
-    if session is None:
-        return None
-
-    # ---------------------------------------------------------------
-    # Save chief complaint
-    # ---------------------------------------------------------------
-
-    if chief_complaint is not None:
-
-        session["chief_complaint"] = chief_complaint.strip()
-
-        session["status"] = "interview_started"
-
-
-    # ---------------------------------------------------------------
-    # Save structured interview answer
-    # ---------------------------------------------------------------
-
-    if field is not None:
-
-        # Ignore empty field names
-        if field.strip():
-
-            session["answers"][field] = answer
-
-            session["status"] = "interview_in_progress"
-
 
     return session
 
@@ -211,14 +153,17 @@ def update_patient(
 
 
 # -------------------------------------------------------------------
-# COMPLETE SESSION
+# UPDATE SESSION
 # -------------------------------------------------------------------
 
-def complete_session(
+def update_session(
     session_id: str,
+    chief_complaint: str | None = None,
+    field: str | None = None,
+    answer: Any = None,
 ) -> dict[str, Any] | None:
     """
-    Mark the clinical intake session as completed.
+    Update information collected during the clinical interview.
     """
 
     session = SESSIONS.get(session_id)
@@ -226,15 +171,125 @@ def complete_session(
     if session is None:
         return None
 
-    session["status"] = "completed"
+    # Save chief complaint
+    if chief_complaint is not None:
+        session["chief_complaint"] = chief_complaint.strip()
+
+        if session["status"] == "consented":
+            session["status"] = "interview_started"
+
+    # Save structured answer
+    if field is not None and field.strip():
+        session["answers"][field] = answer
+        session["status"] = "interview_in_progress"
 
     return session
 
+
+# -------------------------------------------------------------------
+# COMPLETE SESSION
+# -------------------------------------------------------------------
+
+def complete_session(
+    session_id: str,
+) -> dict[str, Any] | None:
+    """
+    Mark the patient interview as completed.
+
+    Once completed, the case enters the doctor's queue
+    with status = waiting.
+    """
+
+    session = SESSIONS.get(session_id)
+
+    if session is None:
+        return None
+
+    session["status"] = "waiting"
+
+    session["completed_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    return session
+
+
+# -------------------------------------------------------------------
+# UPDATE DOCTOR REVIEW STATUS
+# -------------------------------------------------------------------
+
+def update_review_status(
+    session_id: str,
+    status: str,
+) -> dict[str, Any] | None:
+    """
+    Update the doctor's review workflow status.
+
+    Allowed statuses:
+
+    waiting
+    in_review
+    reviewed
+    """
+
+    session = SESSIONS.get(session_id)
+
+    if session is None:
+        return None
+
+    allowed_statuses = {
+        "waiting",
+        "in_review",
+        "reviewed",
+    }
+
+    if status not in allowed_statuses:
+        raise ValueError(
+            f"Invalid review status: {status}"
+        )
+
+    session["status"] = status
+
+    if status == "reviewed":
+        session["reviewed_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+    return session
+
+
+# -------------------------------------------------------------------
+# GET DOCTOR CASES
+# -------------------------------------------------------------------
+
 def get_completed_sessions() -> list[dict[str, Any]]:
-    completed_cases = []
+    """
+    Return completed patient cases.
+
+    Includes all cases that have entered the doctor workflow:
+
+    waiting
+    in_review
+    reviewed
+    """
+
+    doctor_cases = []
 
     for session in SESSIONS.values():
-        if session.get("status") == "completed":
-            completed_cases.append(session)
 
-    return completed_cases
+        if session.get("status") in {
+            "waiting",
+            "in_review",
+            "reviewed",
+        }:
+            doctor_cases.append(session)
+
+    # Newest completed cases first
+    doctor_cases.sort(
+        key=lambda session: session.get(
+            "completed_at"
+        ) or "",
+        reverse=True,
+    )
+
+    return doctor_cases

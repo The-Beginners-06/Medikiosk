@@ -1928,3 +1928,130 @@ p {
     align-items: flex-start;
   }
 }
+/* =========================================================
+   DOCTOR PATIENT QUEUE
+   ========================================================= */
+
+.doctor-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  margin-top: 20px;
+}
+
+.doctor-patient-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 30px;
+
+  padding: 28px;
+
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 18px;
+
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+}
+
+.patient-card-info {
+  flex: 1;
+}
+
+.patient-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+
+  margin-bottom: 24px;
+}
+
+.patient-label {
+  margin: 0 0 6px;
+
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: #6b7280;
+}
+
+.patient-card-header h3 {
+  margin: 0;
+
+  font-size: 25px;
+  font-weight: 700;
+}
+
+.patient-status {
+  padding: 8px 14px;
+
+  border-radius: 999px;
+
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+
+  background: #fff7ed;
+  color: #c2410c;
+}
+
+.patient-details {
+  display: grid;
+  grid-template-columns: 120px 120px minmax(180px, 1fr);
+  gap: 16px;
+}
+
+.patient-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+
+  padding: 14px 16px;
+
+  background: #f8fafc;
+  border-radius: 12px;
+}
+
+.patient-detail span {
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7280;
+}
+
+.patient-detail strong {
+  font-size: 15px;
+  color: #111827;
+}
+
+.patient-card-action {
+  flex-shrink: 0;
+}
+
+.patient-card-action .primary-button {
+  white-space: nowrap;
+}
+
+
+/* =========================================================
+   RESPONSIVE DOCTOR QUEUE
+   ========================================================= */
+
+@media (max-width: 800px) {
+  .doctor-patient-card {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .patient-details {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .patient-detail.complaint {
+    grid-column: 1 / -1;
+  }
+
+  .patient-card-action .primary-button {
+    width: 100%;
+  }
+}

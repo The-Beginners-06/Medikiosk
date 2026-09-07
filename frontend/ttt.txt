@@ -1,0 +1,5171 @@
+clinical.py
+from fastapi import APIRouter
+
+from app.models.clinical import ClinicalHistory
+
+router = APIRouter(
+    prefix="/api/v1/clinical",
+    tags=["Clinical History"],
+)
+
+
+@router.post("/validate")
+def validate_clinical_history(history: ClinicalHistory):
+    return {
+        "valid": True,
+        "message": "Clinical history validated successfully",
+        "data": history.model_dump(),
+    }
+
+----------------------------------------------------------------------
+interview.py
+from typing import Any
+
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+from app.services.interview_engine import get_next_question
+
+
+router = APIRouter(
+    prefix="/api/v1/interview",
+    tags=["Adaptive Interview"],
+)
+
+
+class NextQuestionRequest(BaseModel):
+    complaint: str
+    answers: dict[str, Any] = {}
+
+
+@router.post("/next-question")
+def next_question(request: NextQuestionRequest):
+    result = get_next_question(
+        complaint=request.complaint,
+        answers=request.answers,
+    )
+
+    return result
+
+-----------------------------------------------
+session.py
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.services.session_service import (
+    create_session,
+    get_session,
+    grant_consent,
+    update_session,
+    get_completed_sessions,
+)
+
+from app.services.red_flag_engine import detect_red_flags
+
+
+router = APIRouter(
+    prefix="/api/v1/sessions",
+    tags=["Patient Sessions"],
+)
+
+
+class CreateSessionRequest(BaseModel):
+    language: str = "English"
+
+
+class ConsentRequest(BaseModel):
+    purposes: list[str]
+
+
+class UpdateSessionRequest(BaseModel):
+    chief_complaint: str | None = None
+    field: str | None = None
+    answer: Any = None
+
+
+@router.post("")
+def create_patient_session(request: CreateSessionRequest):
+    return create_session(request.language)
+
+
+@router.get("/{session_id}")
+def read_patient_session(session_id: str):
+    session = get_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    return session
+
+
+@router.post("/{session_id}/consent")
+def record_consent(
+    session_id: str,
+    request: ConsentRequest,
+):
+    session = grant_consent(
+        session_id,
+        request.purposes,
+    )
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    return session
+
+
+@router.patch("/{session_id}")
+def update_patient_session(
+    session_id: str,
+    request: UpdateSessionRequest,
+):
+    session = update_session(
+        session_id=session_id,
+        chief_complaint=request.chief_complaint,
+        field=request.field,
+        answer=request.answer,
+    )
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    return session
+
+
+@router.get("/{session_id}/red-flags")
+def check_red_flags(session_id: str):
+    session = get_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    result = detect_red_flags(
+        complaint=session.get("chief_complaint") or "",
+        answers=session.get("answers") or {},
+    )
+
+    return result
+
+@router.get("/doctor/queue")
+def doctor_queue():
+    return {
+        "count": len(get_completed_sessions()),
+        "cases": get_completed_sessions(),
+    }
+
+@router.post("/{session_id}/complete")
+def complete_patient_session(session_id: str):
+    from app.services.session_service import complete_session
+
+    session = complete_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    return session
+----------------------------------------------------------------------
+interview_engine.py
+
+from typing import Any
+
+
+# -------------------------------------------------------------------
+# MediKiosk Adaptive Clinical Interview Engine
+# -------------------------------------------------------------------
+# The engine uses controlled clinical pathways.
+# It does NOT diagnose the patient.
+# It determines which history information is still missing
+# and selects the next appropriate intake question.
+# -------------------------------------------------------------------
+
+
+QUESTION_PATHWAYS = {
+    "chest_pain": {
+        "display_name": "Chest Pain",
+        "fields": [
+            {
+                "field": "onset",
+                "question": "When did the chest pain start?",
+                "category": "HPI",
+            },
+            {
+                "field": "location",
+                "question": "Where exactly do you feel the pain?",
+                "category": "HPI",
+            },
+            {
+                "field": "character",
+                "question": "How would you describe the pain, for example pressure, burning, stabbing, or tightness?",
+                "category": "HPI",
+            },
+            {
+                "field": "radiation",
+                "question": "Does the pain spread to another part of your body, such as your arm, shoulder, jaw, back, or neck?",
+                "category": "HPI",
+            },
+            {
+                "field": "aggravating_factors",
+                "question": "Does anything make the pain worse, such as walking, breathing, eating, or movement?",
+                "category": "HPI",
+            },
+            {
+                "field": "relieving_factors",
+                "question": "Does anything make the pain better, such as resting or changing position?",
+                "category": "HPI",
+            },
+            {
+                "field": "associated_symptoms",
+                "question": "Are you experiencing any other symptoms along with the chest pain, such as breathlessness, sweating, nausea, dizziness, or palpitations?",
+                "category": "HPI",
+            },
+            {
+                "field": "previous_episodes",
+                "question": "Have you experienced similar chest pain before?",
+                "category": "HPI",
+            },
+        ],
+    },
+
+    "fever": {
+        "display_name": "Fever",
+        "fields": [
+            {
+                "field": "onset",
+                "question": "When did the fever start?",
+                "category": "HPI",
+            },
+            {
+                "field": "duration",
+                "question": "How long have you had the fever?",
+                "category": "HPI",
+            },
+            {
+                "field": "severity",
+                "question": "Do you know the highest temperature you measured?",
+                "category": "HPI",
+            },
+            {
+                "field": "associated_symptoms",
+                "question": "Are you experiencing any other symptoms along with the fever?",
+                "category": "HPI",
+            },
+            {
+                "field": "previous_episodes",
+                "question": "Have you had similar episodes of fever before?",
+                "category": "HPI",
+            },
+        ],
+    },
+
+    "abdominal_pain": {
+        "display_name": "Abdominal Pain",
+        "fields": [
+            {
+                "field": "onset",
+                "question": "When did the abdominal pain start?",
+                "category": "HPI",
+            },
+            {
+                "field": "location",
+                "question": "Where exactly in your abdomen do you feel the pain?",
+                "category": "HPI",
+            },
+            {
+                "field": "character",
+                "question": "How would you describe the pain?",
+                "category": "HPI",
+            },
+            {
+                "field": "aggravating_factors",
+                "question": "Does anything make the pain worse?",
+                "category": "HPI",
+            },
+            {
+                "field": "relieving_factors",
+                "question": "Does anything make the pain better?",
+                "category": "HPI",
+            },
+            {
+                "field": "associated_symptoms",
+                "question": "Do you have any other symptoms such as vomiting, diarrhoea, constipation, or loss of appetite?",
+                "category": "HPI",
+            },
+        ],
+    },
+
+    "headache": {
+        "display_name": "Headache",
+        "fields": [
+            {
+                "field": "onset",
+                "question": "When did the headache start?",
+                "category": "HPI",
+            },
+            {
+                "field": "location",
+                "question": "Where on your head do you feel the headache?",
+                "category": "HPI",
+            },
+            {
+                "field": "character",
+                "question": "How would you describe the headache?",
+                "category": "HPI",
+            },
+            {
+                "field": "severity",
+                "question": "On a scale from 0 to 10, how severe is the headache?",
+                "category": "HPI",
+            },
+            {
+                "field": "associated_symptoms",
+                "question": "Do you have any other symptoms such as vomiting, vision changes, weakness, dizziness, or sensitivity to light?",
+                "category": "HPI",
+            },
+            {
+                "field": "previous_episodes",
+                "question": "Have you experienced similar headaches before?",
+                "category": "HPI",
+            },
+        ],
+    },
+}
+
+
+def normalize_complaint(complaint: str) -> str:
+    """
+    Convert a patient's chief complaint into a supported
+    internal pathway identifier.
+
+    This is intentionally simple for the first engine version.
+    A later NLP layer can improve this without changing
+    the clinical pathway architecture.
+    """
+
+    text = complaint.lower().strip()
+
+    aliases = {
+        "chest pain": "chest_pain",
+        "pain in chest": "chest_pain",
+        "chest discomfort": "chest_pain",
+
+        "fever": "fever",
+        "high temperature": "fever",
+
+        "abdominal pain": "abdominal_pain",
+        "stomach pain": "abdominal_pain",
+        "belly pain": "abdominal_pain",
+
+        "headache": "headache",
+        "head pain": "headache",
+    }
+
+    return aliases.get(text, "general")
+
+
+def get_next_question(
+    complaint: str,
+    answers: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Determine the next missing question for a complaint.
+
+    Returns:
+        {
+            "completed": bool,
+            "question": str | None,
+            "field": str | None,
+            "category": str | None,
+            "pathway": str
+        }
+    """
+
+    pathway_key = normalize_complaint(complaint)
+
+    if pathway_key == "general":
+        return {
+            "completed": False,
+            "question": (
+                "Please describe your main problem in your own words."
+            ),
+            "field": "free_text",
+            "category": "Chief Complaint",
+            "pathway": "general",
+        }
+
+    pathway = QUESTION_PATHWAYS[pathway_key]
+
+    for item in pathway["fields"]:
+        field = item["field"]
+
+        if field not in answers:
+            return {
+                "completed": False,
+                "question": item["question"],
+                "field": field,
+                "category": item["category"],
+                "pathway": pathway_key,
+            }
+
+        value = answers[field]
+
+        if value is None:
+            return {
+                "completed": False,
+                "question": item["question"],
+                "field": field,
+                "category": item["category"],
+                "pathway": pathway_key,
+            }
+
+        if isinstance(value, str) and not value.strip():
+            return {
+                "completed": False,
+                "question": item["question"],
+                "field": field,
+                "category": item["category"],
+                "pathway": pathway_key,
+            }
+
+    return {
+        "completed": True,
+        "question": None,
+        "field": None,
+        "category": None,
+        "pathway": pathway_key,
+    }
+-----------------------------------------------------------------------
+red_flag_engine.py
+
+from typing import Any
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    return str(value).strip().lower()
+
+
+def detect_red_flags(
+    complaint: str,
+    answers: dict[str, Any],
+) -> dict[str, Any]:
+
+    complaint_text = normalize_text(complaint)
+
+    all_text = " ".join(
+        [
+            complaint_text,
+            *[
+                normalize_text(value)
+                for value in answers.values()
+            ],
+        ]
+    )
+
+    flags = []
+
+    # -------------------------------------------------
+    # CHEST PAIN RED FLAGS
+    # -------------------------------------------------
+
+    chest_pain_terms = [
+        "chest pain",
+        "pain in chest",
+        "chest discomfort",
+        "pressure in chest",
+        "tightness in chest",
+    ]
+
+    breathing_terms = [
+        "difficulty breathing",
+        "breathing difficulty",
+        "shortness of breath",
+        "breathlessness",
+        "can't breathe",
+        "cannot breathe",
+    ]
+
+    sweating_terms = [
+        "sweating",
+        "sweating heavily",
+        "cold sweat",
+    ]
+
+    fainting_terms = [
+        "fainted",
+        "fainting",
+        "passed out",
+        "unconscious",
+    ]
+
+    chest_pain = any(
+        term in all_text
+        for term in chest_pain_terms
+    )
+
+    breathing_difficulty = any(
+        term in all_text
+        for term in breathing_terms
+    )
+
+    sweating = any(
+        term in all_text
+        for term in sweating_terms
+    )
+
+    fainting = any(
+        term in all_text
+        for term in fainting_terms
+    )
+
+    if chest_pain and (
+        breathing_difficulty
+        or sweating
+        or fainting
+    ):
+        flags.append(
+            {
+                "type": "chest_pain",
+                "severity": "urgent",
+                "message": (
+                    "Chest pain with additional concerning "
+                    "symptoms was reported."
+                ),
+            }
+        )
+
+    # -------------------------------------------------
+    # SEVERE BREATHING DIFFICULTY
+    # -------------------------------------------------
+
+    severe_breathing_terms = [
+        "cannot breathe",
+        "can't breathe",
+        "unable to breathe",
+        "very difficult to breathe",
+        "severe breathing difficulty",
+    ]
+
+    if any(
+        term in all_text
+        for term in severe_breathing_terms
+    ):
+        flags.append(
+            {
+                "type": "breathing",
+                "severity": "urgent",
+                "message": (
+                    "Severe breathing difficulty was reported."
+                ),
+            }
+        )
+
+    # -------------------------------------------------
+    # FAINTING / LOSS OF CONSCIOUSNESS
+    # -------------------------------------------------
+
+    if fainting:
+        flags.append(
+            {
+                "type": "fainting",
+                "severity": "urgent",
+                "message": (
+                    "Fainting or loss of consciousness "
+                    "was reported."
+                ),
+            }
+        )
+
+    # -------------------------------------------------
+    # SEVERE HEADACHE + NEUROLOGICAL SYMPTOMS
+    # -------------------------------------------------
+
+    headache_terms = [
+        "severe headache",
+        "worst headache",
+        "very severe headache",
+        "sudden severe headache",
+    ]
+
+    neurological_terms = [
+        "weakness",
+        "numbness",
+        "confusion",
+        "difficulty speaking",
+        "slurred speech",
+        "vision loss",
+        "blurred vision",
+        "seizure",
+        "convulsion",
+    ]
+
+    severe_headache = any(
+        term in all_text
+        for term in headache_terms
+    )
+
+    neurological_symptom = any(
+        term in all_text
+        for term in neurological_terms
+    )
+
+    if severe_headache and neurological_symptom:
+        flags.append(
+            {
+                "type": "neurological",
+                "severity": "urgent",
+                "message": (
+                    "Severe headache with a neurological "
+                    "symptom was reported."
+                ),
+            }
+        )
+
+    # -------------------------------------------------
+    # GENERAL SEVERE SYMPTOMS
+    # -------------------------------------------------
+
+    emergency_terms = [
+        "severe bleeding",
+        "heavy bleeding",
+        "vomiting blood",
+        "blood in vomit",
+        "black stool",
+        "seizure",
+        "unconscious",
+        "unresponsive",
+    ]
+
+    if any(
+        term in all_text
+        for term in emergency_terms
+    ):
+        flags.append(
+            {
+                "type": "general",
+                "severity": "urgent",
+                "message": (
+                    "A potentially serious symptom "
+                    "was reported."
+                ),
+            }
+        )
+
+    # -------------------------------------------------
+    # FINAL RESULT
+    # -------------------------------------------------
+
+    if flags:
+        return {
+            "has_red_flags": True,
+            "urgency": "urgent",
+            "message": (
+                "Please alert a healthcare professional "
+                "immediately. Some of your responses may "
+                "require urgent clinical attention."
+            ),
+            "flags": flags,
+        }
+
+    return {
+        "has_red_flags": False,
+        "urgency": "routine",
+        "message": (
+            "No predefined urgent warning pattern "
+            "was detected."
+        ),
+        "flags": [],
+    }
+--------------------------------------------------------------------
+session_service.py
+
+from typing import Any
+from uuid import uuid4
+
+
+# -------------------------------------------------------------------
+# MediKiosk Patient Session Service
+# -------------------------------------------------------------------
+# This service manages the temporary patient session during
+# the clinical intake process.
+#
+# It stores:
+# - selected language
+# - consent
+# - patient information
+# - chief complaint
+# - structured interview answers
+#
+# This is currently an in-memory MVP.
+# Later, it can be connected to PostgreSQL or another database.
+# -------------------------------------------------------------------
+
+
+# Temporary in-memory session storage
+SESSIONS: dict[str, dict[str, Any]] = {}
+
+
+# -------------------------------------------------------------------
+# CREATE SESSION
+# -------------------------------------------------------------------
+
+def create_session(language: str = "English") -> dict[str, Any]:
+    """
+    Create a new MediKiosk patient session.
+    """
+
+    session_id = str(uuid4())
+
+    session = {
+        "session_id": session_id,
+
+        # Patient-selected language
+        "language": language,
+
+        # Consent information
+        "consent": {
+            "granted": False,
+            "purposes": [],
+        },
+
+        # Basic patient information
+        "patient": {
+            "name": None,
+            "age": None,
+            "sex": None,
+        },
+
+        # Main presenting complaint
+        "chief_complaint": None,
+
+        # Structured clinical interview answers
+        #
+        # Example:
+        # {
+        #     "onset": "Yesterday",
+        #     "duration": "1 day",
+        #     "severity": "102°F",
+        #     "associated_symptoms": "Headache"
+        # }
+        "answers": {},
+
+        # Session status
+        "status": "created",
+    }
+
+    SESSIONS[session_id] = session
+
+    return session
+
+
+# -------------------------------------------------------------------
+# GET SESSION
+# -------------------------------------------------------------------
+
+def get_session(session_id: str) -> dict[str, Any] | None:
+    """
+    Retrieve an existing patient session.
+    """
+
+    return SESSIONS.get(session_id)
+
+
+# -------------------------------------------------------------------
+# GRANT CONSENT
+# -------------------------------------------------------------------
+
+def grant_consent(
+    session_id: str,
+    purposes: list[str],
+) -> dict[str, Any] | None:
+    """
+    Record patient consent for the specified purposes.
+    """
+
+    session = SESSIONS.get(session_id)
+
+    if session is None:
+        return None
+
+    session["consent"] = {
+        "granted": True,
+        "purposes": purposes,
+    }
+
+    session["status"] = "consented"
+
+    return session
+
+
+# -------------------------------------------------------------------
+# UPDATE SESSION
+# -------------------------------------------------------------------
+
+def update_session(
+    session_id: str,
+    chief_complaint: str | None = None,
+    field: str | None = None,
+    answer: Any = None,
+) -> dict[str, Any] | None:
+    """
+    Update information collected during the clinical intake.
+
+    The function supports two types of updates:
+
+    1. Chief complaint
+
+       chief_complaint="fever"
+
+    2. Structured interview answer
+
+       field="onset"
+       answer="Yesterday evening"
+
+    This allows the adaptive interview engine to build a
+    structured clinical history.
+    """
+
+    session = SESSIONS.get(session_id)
+
+    if session is None:
+        return None
+
+    # ---------------------------------------------------------------
+    # Save chief complaint
+    # ---------------------------------------------------------------
+
+    if chief_complaint is not None:
+
+        session["chief_complaint"] = chief_complaint.strip()
+
+        session["status"] = "interview_started"
+
+
+    # ---------------------------------------------------------------
+    # Save structured interview answer
+    # ---------------------------------------------------------------
+
+    if field is not None:
+
+        # Ignore empty field names
+        if field.strip():
+
+            session["answers"][field] = answer
+
+            session["status"] = "interview_in_progress"
+
+
+    return session
+
+
+# -------------------------------------------------------------------
+# UPDATE PATIENT INFORMATION
+# -------------------------------------------------------------------
+
+def update_patient(
+    session_id: str,
+    name: str | None = None,
+    age: int | None = None,
+    sex: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Save basic patient information.
+    """
+
+    session = SESSIONS.get(session_id)
+
+    if session is None:
+        return None
+
+    patient = session["patient"]
+
+    if name is not None:
+        patient["name"] = name.strip()
+
+    if age is not None:
+        patient["age"] = age
+
+    if sex is not None:
+        patient["sex"] = sex
+
+    return session
+
+
+# -------------------------------------------------------------------
+# COMPLETE SESSION
+# -------------------------------------------------------------------
+
+def complete_session(
+    session_id: str,
+) -> dict[str, Any] | None:
+    """
+    Mark the clinical intake session as completed.
+    """
+
+    session = SESSIONS.get(session_id)
+
+    if session is None:
+        return None
+
+    session["status"] = "completed"
+
+    return session
+
+def get_completed_sessions() -> list[dict[str, Any]]:
+    completed_cases = []
+
+    for session in SESSIONS.values():
+        if session.get("status") == "completed":
+            completed_cases.append(session)
+
+    return completed_cases
+-----------------------------------------------------------------------------------
+main.py
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.clinical import router as clinical_router
+from app.api.interview import router as interview_router
+from app.api.session import router as session_router
+
+
+app = FastAPI(
+    title="MediKiosk API",
+    description="AI-powered clinical intake platform",
+    version="0.1.0",
+)
+
+
+# Allow the React frontend to communicate with FastAPI
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "MediKiosk",
+        "status": "online",
+        "message": "MediKiosk backend is running",
+    }
+
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy"
+    }
+
+
+app.include_router(clinical_router)
+app.include_router(interview_router)
+app.include_router(session_router)
+
+-------------------------------------------------------------------------------------------------------------------------------
+DoctorLogin.jsx
+
+import { useState } from "react";
+
+function DoctorLogin({ onLogin, onBack }) {
+  const [doctorId, setDoctorId] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [rememberDevice, setRememberDevice] = useState(false);
+
+  function handleLogin(event) {
+    event.preventDefault();
+
+    if (!doctorId.trim()) {
+      alert("Please enter your Doctor ID.");
+      return;
+    }
+
+    if (!password.trim()) {
+      alert("Please enter your password.");
+      return;
+    }
+
+    onLogin({
+      doctorId: doctorId.trim(),
+      name: "Dr. Demo",
+    });
+  }
+
+  return (
+    <div className="kiosk portal-page">
+      <div className="portal-header">
+        <div className="brand">
+          <div className="logo small">M</div>
+
+          <div>
+            <strong>MediKiosk</strong>
+            <span>Clinical Intelligence Platform</span>
+          </div>
+        </div>
+
+        <div className="header-security">
+          🔒 Secure Clinical Portal
+        </div>
+      </div>
+
+      <div className="portal-content">
+        <div className="portal-info doctor-info">
+          <div className="portal-icon doctor-icon">
+            🩺
+          </div>
+
+          <p className="step-label">HEALTHCARE PROFESSIONAL</p>
+
+          <h1>
+            Clinical intelligence
+            <br />
+            at your fingertips.
+          </h1>
+
+          <p className="portal-description">
+            Review structured patient histories, identify
+            predefined warning patterns and make informed
+            clinical decisions.
+          </p>
+
+          <div className="feature-list">
+            <div>
+              <span>✓</span>
+              <div>
+                <strong>Patient Queue</strong>
+                <p>View patients waiting for clinical review.</p>
+              </div>
+            </div>
+
+            <div>
+              <span>✓</span>
+              <div>
+                <strong>Structured History</strong>
+                <p>Review organized clinical information.</p>
+              </div>
+            </div>
+
+            <div>
+              <span>✓</span>
+              <div>
+                <strong>Safety Screening</strong>
+                <p>Review predefined urgent warning patterns.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="login-card portal-login-card doctor-login-card">
+          <div className="card-heading">
+            <div className="card-icon doctor-card-icon">
+              🩺
+            </div>
+
+            <div>
+              <h2>Doctor Sign In</h2>
+              <p>Access your secure clinical workspace.</p>
+            </div>
+          </div>
+
+          <form onSubmit={handleLogin}>
+            <div className="form-group">
+              <label htmlFor="doctorId">
+                Doctor ID
+              </label>
+
+              <input
+                id="doctorId"
+                type="text"
+                placeholder="Enter your Doctor ID"
+                value={doctorId}
+                onChange={(event) =>
+                  setDoctorId(event.target.value)
+                }
+                autoComplete="username"
+              />
+            </div>
+
+            <div className="form-group">
+              <div className="password-label">
+                <label htmlFor="doctorPassword">
+                  Password
+                </label>
+
+                <button
+                  type="button"
+                  className="show-password"
+                  onClick={() =>
+                    setShowPassword(!showPassword)
+                  }
+                >
+                  {showPassword ? "Hide" : "Show"}
+                </button>
+              </div>
+
+              <input
+                id="doctorPassword"
+                type={
+                  showPassword
+                    ? "text"
+                    : "password"
+                }
+                placeholder="Enter your password"
+                value={password}
+                onChange={(event) =>
+                  setPassword(event.target.value)
+                }
+                autoComplete="current-password"
+              />
+            </div>
+
+            <div className="login-options">
+              <label className="remember-option">
+                <input
+                  type="checkbox"
+                  checked={rememberDevice}
+                  onChange={(event) =>
+                    setRememberDevice(
+                      event.target.checked
+                    )
+                  }
+                />
+
+                <span>Remember this device</span>
+              </label>
+
+              <button
+                type="button"
+                className="forgot-button"
+                onClick={() =>
+                  alert(
+                    "Please contact your hospital administrator to reset your password."
+                  )
+                }
+              >
+                Forgot password?
+              </button>
+            </div>
+
+            <button
+              type="submit"
+              className="primary-button full-width"
+            >
+              🔐 Secure Login →
+            </button>
+          </form>
+
+          <div className="security-box">
+            <div>🛡️</div>
+
+            <div>
+              <strong>Authorized Access Only</strong>
+              <p>
+                This portal is intended for authorized
+                healthcare professionals. All clinical
+                actions should be performed according to
+                hospital policies.
+              </p>
+            </div>
+          </div>
+
+          <div className="prototype-note">
+            <strong>Prototype Mode</strong>
+            <p>
+              Demonstration login is enabled for this
+              hackathon prototype. Production deployment
+              should use secure hospital authentication,
+              role-based access and session management.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            className="back-button"
+            onClick={onBack}
+          >
+            ← Back to Role Selection
+          </button>
+        </div>
+      </div>
+
+      <div className="portal-footer">
+        <span>🔒 Secure Clinical Environment</span>
+        <span>•</span>
+        <span>Role-Based Access</span>
+        <span>•</span>
+        <span>MediKiosk Prototype</span>
+      </div>
+    </div>
+  );
+}
+
+export default DoctorLogin;
+----------------------------------------------------------------------------------
+PatientLogin.jsx
+
+import { useState } from "react";
+
+function PatientLogin({ onLogin, onBack }) {
+  const [patientId, setPatientId] = useState("");
+
+  function handleLogin(event) {
+    event.preventDefault();
+
+    if (!patientId.trim()) {
+      alert("Please enter your ABHA Number or Patient ID.");
+      return;
+    }
+
+    onLogin({
+      patientId: patientId.trim(),
+      name: "Demo Patient",
+    });
+  }
+
+  return (
+    <div className="kiosk portal-page">
+      <div className="portal-header">
+        <div className="brand">
+          <div className="logo small">M</div>
+
+          <div>
+            <strong>MediKiosk</strong>
+            <span>AI Clinical Intake</span>
+          </div>
+        </div>
+
+        <div className="header-actions">
+          <span>🌐 {localStorage.getItem("language") || "English"}</span>
+          <span>♿ Accessibility</span>
+        </div>
+      </div>
+
+      <div className="portal-content">
+        <div className="portal-info">
+          <div className="portal-icon patient-icon">
+            👤
+          </div>
+
+          <p className="step-label">PATIENT PORTAL</p>
+
+          <h1>Your health.<br />Your history.<br />Your care.</h1>
+
+          <p className="portal-description">
+            Securely begin your digital clinical intake and
+            provide your healthcare team with a structured
+            history before your consultation.
+          </p>
+
+          <div className="feature-list">
+            <div>
+              <span>✓</span>
+              <div>
+                <strong>Structured History</strong>
+                <p>Your symptoms are organized for your doctor.</p>
+              </div>
+            </div>
+
+            <div>
+              <span>✓</span>
+              <div>
+                <strong>Voice Enabled</strong>
+                <p>Speak naturally in your selected language.</p>
+              </div>
+            </div>
+
+            <div>
+              <span>✓</span>
+              <div>
+                <strong>Consent Based</strong>
+                <p>You control how your information is used.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="login-card portal-login-card">
+          <div className="card-heading">
+            <div className="card-icon">
+              👤
+            </div>
+
+            <div>
+              <h2>Patient Identity</h2>
+              <p>Sign in to continue your healthcare journey.</p>
+            </div>
+          </div>
+
+          <form onSubmit={handleLogin}>
+            <div className="form-group">
+              <label htmlFor="patientId">
+                ABHA Number / Patient ID
+              </label>
+
+              <input
+                id="patientId"
+                type="text"
+                placeholder="Enter your ABHA Number or Patient ID"
+                value={patientId}
+                onChange={(event) =>
+                  setPatientId(event.target.value)
+                }
+                autoComplete="off"
+              />
+
+              <p className="input-help">
+                Enter your registered patient identifier.
+              </p>
+            </div>
+
+            <button
+              type="submit"
+              className="primary-button full-width"
+            >
+              Continue as Patient →
+            </button>
+          </form>
+
+          <div className="security-box">
+            <div>🔐</div>
+
+            <div>
+              <strong>Secure & Consent-Based</strong>
+              <p>
+                Your health information is handled securely.
+                In the production system, ABHA/ABDM identity
+                and consent services can be integrated here.
+              </p>
+            </div>
+          </div>
+
+          <div className="prototype-note">
+            <strong>Prototype Mode</strong>
+            <p>
+              For this demonstration, any Patient ID can be
+              used. No real ABHA verification is performed.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            className="back-button"
+            onClick={onBack}
+          >
+            ← Back to Role Selection
+          </button>
+        </div>
+      </div>
+
+      <div className="portal-footer">
+        <span>🔒 Privacy First</span>
+        <span>•</span>
+        <span>Designed for healthcare environments</span>
+        <span>•</span>
+        <span>MediKiosk Prototype</span>
+      </div>
+    </div>
+  );
+}
+
+export default PatientLogin;
+--------------------------------------------------------------------------------------------------
+App.jsx
+
+import { useEffect, useState } from "react";
+
+import PatientLogin from "./pages/PatientLogin";
+import DoctorLogin from "./pages/DoctorLogin";
+
+const API = "http://127.0.0.1:8000";
+
+function App() {
+  const [screen, setScreen] = useState("language");
+
+  const [language, setLanguage] = useState("English");
+
+  const [patientUser, setPatientUser] = useState(null);
+  const [doctorUser, setDoctorUser] = useState(null);
+
+  const [sessionId, setSessionId] = useState(null);
+
+  const [name, setName] = useState("");
+  const [age, setAge] = useState("");
+  const [sex, setSex] = useState("");
+
+  const [complaint, setComplaint] = useState("");
+
+  const [question, setQuestion] = useState("");
+  const [field, setField] = useState("");
+  const [answer, setAnswer] = useState("");
+
+  const [answers, setAnswers] = useState({});
+
+  const [completed, setCompleted] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+
+  const [redFlagResult, setRedFlagResult] = useState(null);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const [doctorCases, setDoctorCases] = useState([]);
+  const [selectedCase, setSelectedCase] = useState(null);
+
+  // ---------------------------------------------------------
+  // LANGUAGE
+  // ---------------------------------------------------------
+
+  function selectLanguage(selectedLanguage) {
+    setLanguage(selectedLanguage);
+    localStorage.setItem("language", selectedLanguage);
+    setScreen("welcome");
+  }
+
+  // ---------------------------------------------------------
+  // LOGIN
+  // ---------------------------------------------------------
+
+  function handlePatientLogin(user) {
+    setPatientUser(user);
+    setName(user.name || "");
+    setScreen("patientPortal");
+  }
+
+  function handleDoctorLogin(user) {
+    setDoctorUser(user);
+    setScreen("doctorDashboard");
+    loadDoctorCases();
+  }
+
+  function logout() {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+
+    setSpeaking(false);
+    setPatientUser(null);
+    setDoctorUser(null);
+    setSessionId(null);
+    setSelectedCase(null);
+
+    setScreen("language");
+  }
+
+  // ---------------------------------------------------------
+  // CREATE PATIENT SESSION
+  // ---------------------------------------------------------
+
+  async function createPatientSession() {
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(`${API}/api/v1/sessions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          language: language,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Could not create patient session.");
+      }
+
+      const data = await response.json();
+
+      setSessionId(data.session_id);
+
+      setScreen("consent");
+    } catch (err) {
+      console.error(err);
+      setError(
+        "Unable to connect to MediKiosk backend. Please make sure the FastAPI server is running."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // CONSENT
+  // ---------------------------------------------------------
+
+  async function giveConsent() {
+    if (!sessionId) {
+      setError("Patient session was not created.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/sessions/${sessionId}/consent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            purposes: [
+              "Clinical history taking",
+              "Doctor review",
+              "Safety screening",
+            ],
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Consent could not be recorded.");
+      }
+
+      setScreen("patient");
+    } catch (err) {
+      console.error(err);
+      setError("Could not save your consent.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // SAVE PATIENT INFORMATION
+  // ---------------------------------------------------------
+
+  async function savePatientInformation() {
+    if (!sessionId) {
+      setError("Patient session was not created.");
+      return;
+    }
+
+    if (!name.trim()) {
+      alert("Please enter your name.");
+      return;
+    }
+
+    if (!age) {
+      alert("Please enter your age.");
+      return;
+    }
+
+    if (!sex) {
+      alert("Please select your sex.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/sessions/${sessionId}`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            field: "patient_information",
+            answer: {
+              name: name.trim(),
+              age: Number(age),
+              sex: sex,
+            },
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not save patient information.");
+      }
+
+      await startInterview();
+    } catch (err) {
+      console.error(err);
+      setError("Could not save patient information.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // START INTERVIEW
+  // ---------------------------------------------------------
+
+  async function startInterview() {
+    if (!sessionId) {
+      setError("Patient session was not created.");
+      return;
+    }
+
+    if (!complaint.trim()) {
+      alert("Please enter your main health concern.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/sessions/${sessionId}`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            chief_complaint: complaint.trim(),
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not save chief complaint.");
+      }
+
+      setAnswers({});
+
+      await getNextQuestion({});
+
+      setScreen("interview");
+    } catch (err) {
+      console.error(err);
+      setError("Could not start the clinical interview.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // GET NEXT QUESTION
+  // ---------------------------------------------------------
+
+  async function getNextQuestion(currentAnswers) {
+    if (!complaint.trim()) {
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/interview/next-question`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            complaint: complaint.trim(),
+            answers: currentAnswers,
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not get next question.");
+      }
+
+      const data = await response.json();
+
+      // -----------------------------------------------------
+      // INTERVIEW COMPLETED
+      // -----------------------------------------------------
+
+      if (data.completed === true) {
+        if (window.speechSynthesis) {
+          window.speechSynthesis.cancel();
+        }
+
+        setSpeaking(false);
+        setCompleted(true);
+        setQuestion("");
+        setField("");
+        setAnswer("");
+
+        // IMPORTANT:
+        // Mark the patient session as completed in backend.
+        try {
+          const completeResponse = await fetch(
+            `${API}/api/v1/sessions/${sessionId}/complete`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+            }
+          );
+
+          if (!completeResponse.ok) {
+            console.error(
+              "Backend could not mark session as completed."
+            );
+          }
+        } catch (completeError) {
+          console.error(
+            "Session completion error:",
+            completeError
+          );
+        }
+
+        await checkRedFlags();
+
+        return;
+      }
+
+      setQuestion(data.question || "");
+      setField(data.field || "");
+
+      // Automatically speak the question.
+      speakText(data.question || "");
+    } catch (err) {
+      console.error(err);
+      setError("Could not load the next interview question.");
+    }
+  }
+
+  // ---------------------------------------------------------
+  // SUBMIT ANSWER
+  // ---------------------------------------------------------
+
+  async function submitAnswer() {
+    if (!field) {
+      return;
+    }
+
+    if (!answer.trim()) {
+      alert("Please provide an answer.");
+      return;
+    }
+
+    const updatedAnswers = {
+      ...answers,
+      [field]: answer.trim(),
+    };
+
+    setAnswers(updatedAnswers);
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/sessions/${sessionId}`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            field: field,
+            answer: answer.trim(),
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not save answer.");
+      }
+
+      setAnswer("");
+
+      await getNextQuestion(updatedAnswers);
+    } catch (err) {
+      console.error(err);
+      setError("Could not save your answer.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // RED FLAG CHECK
+  // ---------------------------------------------------------
+
+  async function checkRedFlags() {
+    if (!sessionId) {
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/sessions/${sessionId}/red-flags`
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not check red flags.");
+      }
+
+      const data = await response.json();
+
+      setRedFlagResult(data);
+    } catch (err) {
+      console.error("Red flag check failed:", err);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // TEXT TO SPEECH
+  // ---------------------------------------------------------
+
+  function speakText(text) {
+    if (!text || !window.speechSynthesis) {
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+
+    if (language === "Hindi") {
+      utterance.lang = "hi-IN";
+    } else if (language === "Marathi") {
+      utterance.lang = "mr-IN";
+    } else {
+      utterance.lang = "en-IN";
+    }
+
+    utterance.onstart = () => setSpeaking(true);
+    utterance.onend = () => setSpeaking(false);
+    utterance.onerror = () => setSpeaking(false);
+
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function stopSpeaking() {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+
+    setSpeaking(false);
+  }
+
+  // ---------------------------------------------------------
+  // DOCTOR DASHBOARD
+  // ---------------------------------------------------------
+
+  async function loadDoctorCases() {
+    try {
+      const response = await fetch(
+        `${API}/api/v1/sessions/doctor/queue`
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not load doctor queue.");
+      }
+
+      const data = await response.json();
+
+      setDoctorCases(data.cases || []);
+    } catch (err) {
+      console.error("Doctor queue error:", err);
+      setDoctorCases([]);
+    }
+  }
+
+  function openCase(patientCase) {
+    setSelectedCase(patientCase);
+    setScreen("doctor");
+  }
+
+  // ---------------------------------------------------------
+  // REFRESH DOCTOR QUEUE
+  // ---------------------------------------------------------
+
+  useEffect(() => {
+    if (screen !== "doctorDashboard") {
+      return;
+    }
+
+    loadDoctorCases();
+
+    const interval = setInterval(() => {
+      loadDoctorCases();
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [screen]);
+
+  // ---------------------------------------------------------
+  // START NEW PATIENT
+  // ---------------------------------------------------------
+
+  function startNewPatient() {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+
+    setSpeaking(false);
+
+    setPatientUser(null);
+    setSessionId(null);
+
+    setName("");
+    setAge("");
+    setSex("");
+
+    setComplaint("");
+
+    setQuestion("");
+    setField("");
+    setAnswer("");
+
+    setAnswers({});
+
+    setCompleted(false);
+    setRedFlagResult(null);
+
+    setError("");
+
+    setScreen("language");
+  }
+
+  // ---------------------------------------------------------
+  // LANGUAGE SCREEN
+  // ---------------------------------------------------------
+
+  if (screen === "language") {
+    return (
+      <div className="kiosk">
+        <div className="language-card">
+          <div className="logo">M</div>
+
+          <p className="step-label">MEDIKIOSK</p>
+
+          <h1>Choose your language</h1>
+
+          <p className="subtitle">
+            Select your preferred language to begin.
+          </p>
+
+          <div className="language-grid">
+            <button
+              className="language-button"
+              onClick={() => selectLanguage("English")}
+            >
+              <strong>English</strong>
+              <span>English</span>
+            </button>
+
+            <button
+              className="language-button"
+              onClick={() => selectLanguage("Hindi")}
+            >
+              <strong>हिन्दी</strong>
+              <span>Hindi</span>
+            </button>
+
+            <button
+              className="language-button"
+              onClick={() => selectLanguage("Marathi")}
+            >
+              <strong>मराठी</strong>
+              <span>Marathi</span>
+            </button>
+          </div>
+
+          <p className="privacy">
+            🔒 Your information is handled with privacy and
+            consent in mind.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // WELCOME / ROLE SELECTION
+  // ---------------------------------------------------------
+
+  if (screen === "welcome") {
+    return (
+      <div className="kiosk">
+        <div className="welcome-card">
+          <div className="logo">M</div>
+
+          <p className="step-label">MEDIKIOSK</p>
+
+          <h1>
+            AI-Powered
+            <br />
+            Clinical Intake
+          </h1>
+
+          <p className="subtitle">
+            Structured patient history-taking designed to help
+            healthcare professionals begin consultations with
+            better clinical context.
+          </p>
+
+          <div className="role-grid">
+            <button
+              className="role-card"
+              onClick={() => setScreen("patientLogin")}
+            >
+              <div className="role-icon">👤</div>
+
+              <strong>Patient</strong>
+
+              <span>
+                Start your clinical history
+              </span>
+            </button>
+
+            <button
+              className="role-card"
+              onClick={() => setScreen("doctorLogin")}
+            >
+              <div className="role-icon">🩺</div>
+
+              <strong>Doctor</strong>
+
+              <span>
+                Access clinical dashboard
+              </span>
+            </button>
+          </div>
+
+          <div className="accessibility">
+            <span>🌐 {language}</span>
+            <span>♿ Accessibility enabled</span>
+            <span>🔒 Privacy first</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // PATIENT LOGIN
+  // ---------------------------------------------------------
+
+  if (screen === "patientLogin") {
+    return (
+      <PatientLogin
+        onLogin={handlePatientLogin}
+        onBack={() => setScreen("welcome")}
+      />
+    );
+  }
+
+  // ---------------------------------------------------------
+  // DOCTOR LOGIN
+  // ---------------------------------------------------------
+
+  if (screen === "doctorLogin") {
+    return (
+      <DoctorLogin
+        onLogin={handleDoctorLogin}
+        onBack={() => setScreen("welcome")}
+      />
+    );
+  }
+
+  // ---------------------------------------------------------
+  // PATIENT PORTAL
+  // ---------------------------------------------------------
+
+  if (screen === "patientPortal") {
+    return (
+      <div className="kiosk portal-page">
+        <div className="portal-header">
+          <div className="brand">
+            <div className="logo small">M</div>
+
+            <div>
+              <strong>MediKiosk</strong>
+              <span>AI Clinical Intake</span>
+            </div>
+          </div>
+
+          <div className="header-actions">
+            <span>🌐 {language}</span>
+            <span>♿ Accessibility</span>
+          </div>
+        </div>
+
+        <div className="portal-content">
+          <div className="portal-info">
+            <div className="portal-icon patient-icon">
+              👤
+            </div>
+
+            <p className="step-label">PATIENT PORTAL</p>
+
+            <h1>
+              Your health.
+              <br />
+              Your history.
+              <br />
+              Your care.
+            </h1>
+
+            <p className="portal-description">
+              Welcome to MediKiosk. Begin your digital clinical
+              intake and provide your healthcare team with a
+              structured history before your consultation.
+            </p>
+
+            <div className="feature-list">
+              <div>
+                <span>✓</span>
+                <div>
+                  <strong>Structured History</strong>
+                  <p>
+                    Your symptoms are organized for your doctor.
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <span>✓</span>
+                <div>
+                  <strong>Voice Enabled</strong>
+                  <p>
+                    Speak naturally in your selected language.
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <span>✓</span>
+                <div>
+                  <strong>Consent Based</strong>
+                  <p>
+                    You control how your information is used.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="login-card portal-login-card">
+            <div className="card-heading">
+              <div className="card-icon">👤</div>
+
+              <div>
+                <h2>Hello, {name || "Patient"}</h2>
+                <p>
+                  Your patient identity has been recognized.
+                </p>
+              </div>
+            </div>
+
+            <div className="security-box">
+              <div>🔐</div>
+
+              <div>
+                <strong>Ready to Begin</strong>
+
+                <p>
+                  Your Patient ID is:
+                  <br />
+                  <strong>
+                    {patientUser?.patientId}
+                  </strong>
+                </p>
+              </div>
+            </div>
+
+            <button
+              className="primary-button full-width"
+              onClick={createPatientSession}
+              disabled={loading}
+            >
+              {loading
+                ? "Creating Secure Session..."
+                : "Begin Clinical Intake →"}
+            </button>
+
+            <button
+              className="back-button"
+              onClick={() => setScreen("welcome")}
+            >
+              ← Back to Role Selection
+            </button>
+          </div>
+        </div>
+
+        <div className="portal-footer">
+          <span>🔒 Privacy First</span>
+          <span>•</span>
+          <span>Designed for healthcare environments</span>
+          <span>•</span>
+          <span>MediKiosk Prototype</span>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // CONSENT
+  // ---------------------------------------------------------
+
+  if (screen === "consent") {
+    return (
+      <div className="kiosk">
+        <div className="consent-card">
+          <p className="step-label">
+            STEP 1 OF 3
+          </p>
+
+          <h1>
+            Your consent matters
+          </h1>
+
+          <p className="subtitle">
+            Before beginning your clinical history, please
+            review how your information will be used.
+          </p>
+
+          <div className="consent-box">
+            <div>
+              <strong>Clinical History</strong>
+              <p>
+                Your responses will be structured into a
+                clinical history for healthcare professional
+                review.
+              </p>
+            </div>
+
+            <div>
+              <strong>Safety Screening</strong>
+              <p>
+                MediKiosk may identify predefined warning
+                patterns that should receive clinical attention.
+              </p>
+            </div>
+
+            <div>
+              <strong>Doctor Review</strong>
+              <p>
+                Your completed intake will be made available
+                to the authorized doctor through the clinical
+                dashboard.
+              </p>
+            </div>
+          </div>
+
+          <div className="privacy">
+            🔒 You can stop the process at any time.
+          </div>
+
+          {error && (
+            <div className="error-message">
+              {error}
+            </div>
+          )}
+
+          <button
+            className="primary-button full-width"
+            onClick={giveConsent}
+            disabled={loading}
+          >
+            {loading
+              ? "Saving Consent..."
+              : "I Understand & Give Consent →"}
+          </button>
+
+          <button
+            className="back-button"
+            onClick={() => setScreen("patientPortal")}
+          >
+            ← Back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // PATIENT INFORMATION
+  // ---------------------------------------------------------
+
+  if (screen === "patient") {
+    return (
+      <div className="kiosk">
+        <div className="patient-card">
+          <p className="step-label">
+            STEP 2 OF 3
+          </p>
+
+          <h1>Tell us about yourself</h1>
+
+          <p className="subtitle">
+            This information helps your doctor understand
+            your clinical history.
+          </p>
+
+          <div className="form-group">
+            <label htmlFor="name">
+              Full Name
+            </label>
+
+            <input
+              id="name"
+              type="text"
+              placeholder="Enter your full name"
+              value={name}
+              onChange={(event) =>
+                setName(event.target.value)
+              }
+            />
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="age">
+              Age
+            </label>
+
+            <input
+              id="age"
+              type="number"
+              min="1"
+              max="120"
+              placeholder="Enter your age"
+              value={age}
+              onChange={(event) =>
+                setAge(event.target.value)
+              }
+            />
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="sex">
+              Sex
+            </label>
+
+            <select
+              id="sex"
+              value={sex}
+              onChange={(event) =>
+                setSex(event.target.value)
+              }
+            >
+              <option value="">
+                Select
+              </option>
+              <option value="Male">
+                Male
+              </option>
+              <option value="Female">
+                Female
+              </option>
+              <option value="Other">
+                Other
+              </option>
+            </select>
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="complaint">
+              What is your main health concern?
+            </label>
+
+            <textarea
+              id="complaint"
+              placeholder="For example: chest pain, fever, headache..."
+              value={complaint}
+              onChange={(event) =>
+                setComplaint(event.target.value)
+              }
+              rows="4"
+            />
+          </div>
+
+          {error && (
+            <div className="error-message">
+              {error}
+            </div>
+          )}
+
+          <button
+            className="primary-button full-width"
+            onClick={savePatientInformation}
+            disabled={loading}
+          >
+            {loading
+              ? "Starting Clinical Interview..."
+              : "Continue to Clinical Interview →"}
+          </button>
+
+          <button
+            className="back-button"
+            onClick={() => setScreen("consent")}
+          >
+            ← Back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // CLINICAL INTERVIEW
+  // ---------------------------------------------------------
+
+  if (screen === "interview") {
+    if (completed) {
+      return (
+        <div className="kiosk">
+          <div className="interview-card">
+            <div className="completion-banner">
+              ✓ Clinical Interview Complete
+            </div>
+
+            <h1>Your history has been recorded.</h1>
+
+            <p className="subtitle">
+              Your structured clinical history has been
+              successfully prepared for doctor review.
+            </p>
+
+            {redFlagResult && (
+              <div
+                className={`urgency-section ${
+                  redFlagResult.urgent
+                    ? "urgent"
+                    : "routine"
+                }`}
+              >
+                <div className="urgency-header">
+                  <div className="urgency-icon">
+                    {redFlagResult.urgent
+                      ? "⚠️"
+                      : "✓"}
+                  </div>
+
+                  <div>
+                    <h2>
+                      {redFlagResult.urgent
+                        ? "Urgent Warning Pattern Detected"
+                        : "No Urgent Warning Pattern Detected"}
+                    </h2>
+
+                    <p>
+                      {redFlagResult.urgent
+                        ? "Please inform a healthcare professional immediately."
+                        : "Your responses have been prepared for routine clinical review."}
+                    </p>
+                  </div>
+                </div>
+
+                {redFlagResult.flags &&
+                  redFlagResult.flags.length > 0 && (
+                    <div className="flag-list">
+                      <strong>
+                        Warning patterns:
+                      </strong>
+
+                      {redFlagResult.flags.map(
+                        (flag, index) => (
+                          <div
+                            className="flag-item"
+                            key={index}
+                          >
+                            • {flag}
+                          </div>
+                        )
+                      )}
+                    </div>
+                  )}
+              </div>
+            )}
+
+            <div className="summary-section">
+              <h2>Patient Summary</h2>
+
+              <div className="summary-grid">
+                <div>
+                  <span>Name</span>
+                  <strong>{name}</strong>
+                </div>
+
+                <div>
+                  <span>Age</span>
+                  <strong>{age}</strong>
+                </div>
+
+                <div>
+                  <span>Sex</span>
+                  <strong>{sex}</strong>
+                </div>
+              </div>
+            </div>
+
+            <div className="summary-section">
+              <h2>Main Concern</h2>
+
+              <div className="summary-box">
+                {complaint}
+              </div>
+            </div>
+
+            <p className="doctor-note">
+              Your information has been securely submitted
+              to the MediKiosk clinical workflow for doctor
+              review.
+            </p>
+
+            <button
+              className="primary-button full-width"
+              onClick={() => setScreen("welcome")}
+            >
+              Return to Home
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="kiosk">
+        <div className="interview-card">
+          <div className="interview-header">
+            <div>
+              <p className="step-label">
+                STEP 3 OF 3 • CLINICAL HISTORY
+              </p>
+
+              <h1>Let's understand your symptoms.</h1>
+            </div>
+
+            <div className="language-badge">
+              🌐 {language}
+            </div>
+          </div>
+
+          <div className="complaint-box">
+            <span>Main concern</span>
+            <strong>{complaint}</strong>
+          </div>
+
+          <div className="question-section">
+            <div className="question-number">
+              Clinical Question
+            </div>
+
+            <h2>{question}</h2>
+
+            <div className="voice-controls">
+              {!speaking ? (
+                <button
+                  className="secondary-button"
+                  onClick={() => speakText(question)}
+                >
+                  🔊 Read Question
+                </button>
+              ) : (
+                <button
+                  className="secondary-button"
+                  onClick={stopSpeaking}
+                >
+                  ⏹ Stop Speaking
+                </button>
+              )}
+            </div>
+
+            <textarea
+              className="answer-input"
+              placeholder="Type your answer here..."
+              value={answer}
+              onChange={(event) =>
+                setAnswer(event.target.value)
+              }
+              rows="5"
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  event.ctrlKey
+                ) {
+                  submitAnswer();
+                }
+              }}
+            />
+
+            {error && (
+              <div className="error-message">
+                {error}
+              </div>
+            )}
+
+            <button
+              className="primary-button full-width"
+              onClick={submitAnswer}
+              disabled={loading}
+            >
+              {loading
+                ? "Processing..."
+                : "Continue →"}
+            </button>
+
+            <p className="input-help">
+              Press Ctrl + Enter to submit your answer.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // DOCTOR DASHBOARD
+  // ---------------------------------------------------------
+
+  if (screen === "doctorDashboard") {
+    const urgentCases = doctorCases.filter((patientCase) => {
+      const complaintText =
+        patientCase.chief_complaint || "";
+
+      const answersText = JSON.stringify(
+        patientCase.answers || {}
+      );
+
+      const combinedText =
+        `${complaintText} ${answersText}`.toLowerCase();
+
+      return (
+        combinedText.includes("breathing") ||
+        combinedText.includes("faint") ||
+        combinedText.includes("sweating") ||
+        combinedText.includes("unconscious") ||
+        combinedText.includes("severe bleeding")
+      );
+    });
+
+    return (
+      <div className="kiosk">
+        <div className="doctor-card">
+          <div className="doctor-header">
+            <div>
+              <p className="step-label">
+                DOCTOR PORTAL
+              </p>
+
+              <h1>
+                Welcome,{" "}
+                {doctorUser?.name || "Doctor"}
+              </h1>
+
+              <p className="doctor-subtitle">
+                Clinical Intelligence Dashboard
+              </p>
+            </div>
+
+            <div className="review-status">
+              ✓ Authorized
+            </div>
+          </div>
+
+          <div className="summary-grid dashboard-stats">
+            <div>
+              <span>Waiting</span>
+              <strong>
+                {doctorCases.length}
+              </strong>
+            </div>
+
+            <div>
+              <span>In Review</span>
+              <strong>0</strong>
+            </div>
+
+            <div>
+              <span>Urgent</span>
+              <strong>
+                {urgentCases.length}
+              </strong>
+            </div>
+          </div>
+
+          <div className="summary-section">
+            <div className="queue-heading">
+              <div>
+                <h2>Patient Queue</h2>
+                <p>
+                  Completed MediKiosk interviews awaiting
+                  clinical review.
+                </p>
+              </div>
+
+              <button
+                className="secondary-button"
+                onClick={loadDoctorCases}
+              >
+                ↻ Refresh
+              </button>
+            </div>
+
+            {doctorCases.length === 0 ? (
+              <div className="summary-box">
+                <strong>
+                  No completed patient cases yet.
+                </strong>
+
+                <p>
+                  Complete a patient interview in another
+                  tab/browser, then refresh this dashboard.
+                </p>
+              </div>
+            ) : (
+              <div className="case-list">
+                {doctorCases.map((patientCase) => {
+                  const caseAnswers =
+                    patientCase.answers || {};
+
+                  const text =
+                    `${patientCase.chief_complaint || ""} ${JSON.stringify(
+                      caseAnswers
+                    )}`.toLowerCase();
+
+                  const isUrgent =
+                    text.includes("breathing") ||
+                    text.includes("faint") ||
+                    text.includes("sweating") ||
+                    text.includes("unconscious");
+
+                  return (
+                    <div
+                      className="case-row"
+                      key={patientCase.session_id}
+                    >
+                      <div className="case-patient">
+                        <strong>
+                          {patientCase.patient?.name ||
+                            "Patient"}
+                        </strong>
+
+                        <span>
+                          ID:{" "}
+                          {patientCase.session_id.slice(
+                            0,
+                            8
+                          )}
+                        </span>
+                      </div>
+
+                      <div className="case-complaint">
+                        <span>Chief Complaint</span>
+                        <strong>
+                          {patientCase.chief_complaint ||
+                            "Not specified"}
+                        </strong>
+                      </div>
+
+                      <div className="case-priority">
+                        <span>Priority</span>
+
+                        <strong
+                          className={
+                            isUrgent
+                              ? "priority-urgent"
+                              : "priority-routine"
+                          }
+                        >
+                          {isUrgent
+                            ? "🔴 URGENT"
+                            : "🟢 ROUTINE"}
+                        </strong>
+                      </div>
+
+                      <button
+                        className="primary-button review-button"
+                        onClick={() =>
+                          openCase(patientCase)
+                        }
+                      >
+                        Review →
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="summary-section">
+            <h2>Clinical Workflow</h2>
+
+            <div className="summary-box">
+              <strong>
+                Patient completes intake
+              </strong>
+
+              <br />
+
+              ↓
+
+              <br />
+
+              Structured history stored in backend
+
+              <br />
+
+              ↓
+
+              <br />
+
+              Case appears in doctor queue
+
+              <br />
+
+              ↓
+
+              <br />
+
+              Doctor reviews history and safety screening
+            </div>
+          </div>
+
+          <button
+            className="secondary-button"
+            onClick={logout}
+          >
+            Logout
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // DOCTOR CLINICAL REVIEW
+  // ---------------------------------------------------------
+
+  if (screen === "doctor") {
+    if (!selectedCase) {
+      return (
+        <div className="kiosk">
+          <div className="doctor-card">
+            <h1>No patient selected</h1>
+
+            <button
+              className="primary-button"
+              onClick={() =>
+                setScreen("doctorDashboard")
+              }
+            >
+              ← Back to Dashboard
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    const patient = selectedCase.patient || {};
+    const caseAnswers =
+      selectedCase.answers || {};
+
+    const caseText =
+      `${selectedCase.chief_complaint || ""} ${JSON.stringify(
+        caseAnswers
+      )}`.toLowerCase();
+
+    const caseUrgent =
+      caseText.includes("breathing") ||
+      caseText.includes("faint") ||
+      caseText.includes("sweating") ||
+      caseText.includes("unconscious") ||
+      caseText.includes("severe bleeding");
+
+    return (
+      <div className="kiosk">
+        <div className="doctor-card">
+          <div className="doctor-header">
+            <div>
+              <p className="step-label">
+                CLINICAL REVIEW
+              </p>
+
+              <h1>Patient History</h1>
+
+              <p className="doctor-subtitle">
+                Session ID:{" "}
+                {selectedCase.session_id}
+              </p>
+            </div>
+
+            <div className="review-status">
+              ✓ Completed Intake
+            </div>
+          </div>
+
+          <div
+            className={`urgency-section ${
+              caseUrgent ? "urgent" : "routine"
+            }`}
+          >
+            <div className="urgency-header">
+              <div className="urgency-icon">
+                {caseUrgent ? "⚠️" : "✓"}
+              </div>
+
+              <div>
+                <h2>
+                  {caseUrgent
+                    ? "Urgent Warning Pattern"
+                    : "No Urgent Warning Pattern Detected"}
+                </h2>
+
+                <p>
+                  {caseUrgent
+                    ? "Review the patient promptly according to clinical judgment."
+                    : "No predefined urgent pattern was detected by the prototype safety screening."}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="summary-section">
+            <h2>Patient Information</h2>
+
+            <div className="summary-grid">
+              <div>
+                <span>Name</span>
+                <strong>
+                  {patient.name ||
+                    "Not available"}
+                </strong>
+              </div>
+
+              <div>
+                <span>Age</span>
+                <strong>
+                  {patient.age ||
+                    "Not available"}
+                </strong>
+              </div>
+
+              <div>
+                <span>Sex</span>
+                <strong>
+                  {patient.sex ||
+                    "Not available"}
+                </strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="summary-section">
+            <h2>Chief Complaint</h2>
+
+            <div className="summary-box">
+              {selectedCase.chief_complaint ||
+                "Not specified"}
+            </div>
+          </div>
+
+          <div className="summary-section">
+            <h2>Structured Clinical History</h2>
+
+            {Object.keys(caseAnswers).length ===
+            0 ? (
+              <div className="summary-box">
+                No structured answers recorded.
+              </div>
+            ) : (
+              <div className="history-list">
+                {Object.entries(caseAnswers).map(
+                  ([key, value]) => {
+                    if (
+                      key ===
+                      "patient_information"
+                    ) {
+                      return null;
+                    }
+
+                    return (
+                      <div
+                        className="history-item"
+                        key={key}
+                      >
+                        <span>
+                          {key.replace(
+                            /_/g,
+                            " "
+                          )}
+                        </span>
+
+                        <strong>
+                          {typeof value ===
+                          "object"
+                            ? JSON.stringify(
+                                value
+                              )
+                            : String(value)}
+                        </strong>
+                      </div>
+                    );
+                  }
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="summary-section">
+            <h2>Clinical Safety Note</h2>
+
+            <div className="summary-box">
+              MediKiosk's warning-pattern engine is a
+              prototype screening aid. It does not diagnose
+              disease and should not replace professional
+              clinical judgment.
+            </div>
+          </div>
+
+          <button
+            className="primary-button full-width"
+            onClick={() =>
+              setScreen("doctorDashboard")
+            }
+          >
+            ← Back to Patient Queue
+          </button>
+
+          <button
+            className="secondary-button full-width"
+            onClick={logout}
+          >
+            Logout
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------------------------------------------------
+  // FALLBACK
+  // ---------------------------------------------------------
+
+  return (
+    <div className="kiosk">
+      <div className="welcome-card">
+        <h1>MediKiosk</h1>
+
+        <p>
+          Something went wrong. Please restart the
+          application.
+        </p>
+
+        <button
+          className="primary-button"
+          onClick={startNewPatient}
+        >
+          Restart
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+------------------------------------------------------------------------------------------------
+App.css 
+
+/* ================================
+   MEDIKIOSK - GLOBAL STYLES
+================================ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: Inter, Arial, sans-serif;
+  background: #eef5f8;
+  color: #16323f;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* ================================
+   MAIN KIOSK AREA
+================================ */
+
+.kiosk {
+  min-height: 100vh;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px;
+  background:
+    radial-gradient(
+      circle at top right,
+      rgba(33, 150, 170, 0.12),
+      transparent 35%
+    ),
+    linear-gradient(135deg, #f4fafb, #eaf3f6);
+}
+
+/* ================================
+   COMMON CARDS
+================================ */
+
+.language-card,
+.welcome-card,
+.consent-card,
+.patient-card,
+.interview-card {
+  width: min(900px, 100%);
+  background: #ffffff;
+  border-radius: 28px;
+  padding: 48px;
+  box-shadow: 0 20px 60px rgba(22, 50, 63, 0.10);
+  border: 1px solid rgba(22, 50, 63, 0.06);
+}
+
+/* ================================
+   LOGO
+================================ */
+
+.logo {
+  width: 72px;
+  height: 72px;
+  margin: 0 auto 22px;
+  border-radius: 22px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: linear-gradient(135deg, #087f8c, #1769aa);
+  color: white;
+
+  font-size: 36px;
+  font-weight: 800;
+
+  box-shadow: 0 10px 25px rgba(23, 105, 170, 0.22);
+}
+
+.logo.small {
+  width: 58px;
+  height: 58px;
+  border-radius: 18px;
+  font-size: 28px;
+  margin-bottom: 18px;
+}
+
+/* ================================
+   TEXT
+================================ */
+
+.step-label {
+  margin: 0 0 12px;
+  color: #087f8c;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 8px 0 16px;
+  color: #16323f;
+  font-size: clamp(32px, 5vw, 46px);
+  line-height: 1.15;
+}
+
+h2 {
+  margin: 0 0 14px;
+  font-size: 22px;
+}
+
+p {
+  line-height: 1.6;
+}
+
+.description {
+  max-width: 650px;
+  margin: 0 auto 34px;
+  color: #55707b;
+  font-size: 18px;
+}
+
+.tagline {
+  margin: 0 0 20px;
+  color: #087f8c;
+  font-size: 21px;
+  font-weight: 700;
+}
+
+/* ================================
+   WELCOME SCREEN
+================================ */
+
+.welcome-card {
+  text-align: center;
+  padding-top: 55px;
+  padding-bottom: 55px;
+}
+
+.accessibility {
+  display: flex;
+  justify-content: center;
+  gap: 28px;
+  flex-wrap: wrap;
+
+  margin-top: 30px;
+
+  color: #607984;
+  font-size: 14px;
+}
+
+.privacy {
+  margin: 24px 0 0;
+  color: #71858d;
+  font-size: 14px;
+}
+
+/* ================================
+   PRIMARY BUTTON
+================================ */
+
+.primary-button {
+  min-height: 58px;
+  border: none;
+  border-radius: 15px;
+
+  padding: 16px 30px;
+
+  background: linear-gradient(135deg, #087f8c, #1769aa);
+  color: white;
+
+  font-size: 18px;
+  font-weight: 750;
+
+  box-shadow: 0 8px 20px rgba(8, 127, 140, 0.18);
+
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.primary-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 25px rgba(8, 127, 140, 0.25);
+}
+
+.primary-button:active {
+  transform: translateY(0);
+}
+
+.full-width {
+  width: 100%;
+}
+
+/* ================================
+   SECONDARY / BACK BUTTON
+================================ */
+
+.secondary-button {
+  min-height: 54px;
+
+  padding: 14px 24px;
+
+  border: 2px solid #d8e5e9;
+  border-radius: 14px;
+
+  background: white;
+  color: #36535e;
+
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.secondary-button:hover {
+  border-color: #087f8c;
+  background: #f5fbfc;
+}
+
+.back-button {
+  margin-top: 22px;
+  padding: 10px 18px;
+
+  border: none;
+  background: transparent;
+
+  color: #087f8c;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.back-button:hover {
+  text-decoration: underline;
+}
+
+/* ================================
+   LANGUAGE SCREEN
+================================ */
+
+.language-card {
+  text-align: center;
+  max-width: 850px;
+}
+
+.language-card > p:not(.step-label):not(.privacy) {
+  max-width: 620px;
+  margin: 0 auto 32px;
+
+  color: #607984;
+  font-size: 18px;
+}
+
+.language-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+
+.language-grid button {
+  min-height: 72px;
+
+  padding: 18px;
+
+  border: 2px solid #d9e6ea;
+  border-radius: 16px;
+
+  background: #ffffff;
+  color: #23434e;
+
+  font-size: 21px;
+  font-weight: 700;
+
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    transform 0.15s ease;
+}
+
+.language-grid button:hover {
+  border-color: #087f8c;
+  background: #f3fbfc;
+  transform: translateY(-2px);
+}
+
+/* ================================
+   CONSENT SCREEN
+================================ */
+
+.consent-card {
+  max-width: 850px;
+}
+
+.consent-box {
+  margin: 25px 0;
+
+  padding: 28px;
+
+  background: #f5fafb;
+  border: 1px solid #dcebed;
+  border-radius: 18px;
+}
+
+.consent-box p {
+  margin: 12px 0;
+  color: #536d76;
+  font-size: 16px;
+}
+
+.consent-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  gap: 20px;
+  margin-top: 28px;
+}
+
+.consent-actions .primary-button {
+  flex: 1;
+}
+
+.consent-actions .secondary-button {
+  flex-shrink: 0;
+}
+
+/* ================================
+   PATIENT INFORMATION
+================================ */
+
+.patient-card {
+  max-width: 780px;
+}
+
+.patient-card > p:not(.step-label):not(.privacy):not(.session-info) {
+  color: #607984;
+  margin-bottom: 30px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+
+  margin-bottom: 20px;
+}
+
+.form-group label {
+  color: #294953;
+  font-size: 15px;
+  font-weight: 750;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  min-height: 54px;
+
+  padding: 14px 16px;
+
+  border: 2px solid #d9e6ea;
+  border-radius: 13px;
+
+  background: white;
+  color: #203f49;
+
+  font-size: 17px;
+
+  outline: none;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  border-color: #087f8c;
+  box-shadow: 0 0 0 4px rgba(8, 127, 140, 0.08);
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+
+.session-info {
+  margin: 4px 0 20px;
+  padding: 12px 16px;
+
+  border-radius: 12px;
+
+  background: #edf8f3;
+  color: #26734d;
+
+  font-size: 14px;
+  font-weight: 650;
+}
+
+/* ================================
+   INTERVIEW SCREEN
+================================ */
+
+.interview-card {
+  max-width: 850px;
+}
+
+.progress-container {
+  width: 100%;
+  height: 8px;
+
+  margin: 15px 0 35px;
+
+  overflow: hidden;
+
+  background: #e4eef1;
+  border-radius: 20px;
+}
+
+.progress-bar {
+  width: 25%;
+  height: 100%;
+
+  background: linear-gradient(90deg, #087f8c, #1769aa);
+
+  border-radius: 20px;
+}
+
+.question {
+  margin: 28px 0;
+
+  color: #203f49;
+
+  font-size: 25px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.voice-button {
+  width: 82px;
+  height: 82px;
+
+  display: block;
+  margin: 25px auto 12px;
+
+  border: none;
+  border-radius: 50%;
+
+  background: linear-gradient(135deg, #087f8c, #1769aa);
+
+  color: white;
+  font-size: 30px;
+
+  box-shadow: 0 10px 25px rgba(8, 127, 140, 0.22);
+}
+
+.voice-button:hover {
+  transform: scale(1.04);
+}
+
+.voice-hint {
+  text-align: center;
+  color: #71858d;
+  font-size: 14px;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+
+  margin: 28px 0;
+
+  color: #8aa0a8;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: #dce7ea;
+}
+
+.complaint-input {
+  width: 100%;
+  min-height: 58px;
+
+  padding: 16px;
+
+  border: 2px solid #d9e6ea;
+  border-radius: 14px;
+
+  font-size: 17px;
+  outline: none;
+
+  margin-bottom: 18px;
+}
+
+.complaint-input:focus {
+  border-color: #087f8c;
+  box-shadow: 0 0 0 4px rgba(8, 127, 140, 0.08);
+}
+
+/* ================================
+   MOBILE / SMALL SCREENS
+================================ */
+
+@media (max-width: 700px) {
+  .kiosk {
+    padding: 20px 14px;
+    align-items: flex-start;
+  }
+
+  .language-card,
+  .welcome-card,
+  .consent-card,
+  .patient-card,
+  .interview-card {
+    padding: 30px 22px;
+    border-radius: 22px;
+  }
+
+  h1 {
+    font-size: 32px;
+  }
+
+  .language-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .form-row {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .consent-actions {
+    flex-direction: column-reverse;
+  }
+
+  .consent-actions button {
+    width: 100%;
+  }
+
+  .question {
+    font-size: 21px;
+  }
+}
+
+/* ================================
+   VERY SMALL SCREENS
+================================ */
+
+@media (max-width: 420px) {
+  .kiosk {
+    padding: 12px;
+  }
+
+  .language-card,
+  .welcome-card,
+  .consent-card,
+  .patient-card,
+  .interview-card {
+    padding: 24px 18px;
+  }
+
+  .language-grid button {
+    min-height: 60px;
+    font-size: 18px;
+  }
+}/* =========================================
+   MEDIKIOSK - MAIN STYLES
+   ========================================= */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  font-family: Arial, Helvetica, sans-serif;
+  background: #eef5f8;
+  color: #16323f;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* =========================================
+   MAIN KIOSK CONTAINER
+   ========================================= */
+
+.kiosk {
+  min-height: 100vh;
+  width: 100%;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 40px 24px;
+
+  background:
+    radial-gradient(
+      circle at top right,
+      rgba(33, 150, 170, 0.12),
+      transparent 35%
+    ),
+    linear-gradient(135deg, #f4fafb, #eaf3f6);
+
+  overflow-y: auto;
+}
+
+/* =========================================
+   COMMON CARDS
+   ========================================= */
+
+.language-card,
+.welcome-card,
+.consent-card,
+.patient-card,
+.interview-card {
+  width: min(900px, 100%);
+  margin: auto;
+
+  background: #ffffff;
+
+  border-radius: 28px;
+
+  padding: 48px;
+
+  border: 1px solid rgba(22, 50, 63, 0.06);
+
+  box-shadow:
+    0 20px 60px rgba(22, 50, 63, 0.10);
+}
+
+/* =========================================
+   LOGO
+   ========================================= */
+
+.logo {
+  width: 72px;
+  height: 72px;
+
+  margin: 0 auto 22px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 22px;
+
+  background: linear-gradient(
+    135deg,
+    #087f8c,
+    #1769aa
+  );
+
+  color: white;
+
+  font-size: 36px;
+  font-weight: 800;
+
+  box-shadow:
+    0 10px 25px rgba(23, 105, 170, 0.22);
+}
+
+.logo.small {
+  width: 58px;
+  height: 58px;
+
+  border-radius: 18px;
+
+  font-size: 28px;
+
+  margin-bottom: 18px;
+}
+
+/* =========================================
+   TEXT
+   ========================================= */
+
+.step-label {
+  margin: 0 0 12px;
+
+  color: #087f8c;
+
+  font-size: 13px;
+  font-weight: 800;
+
+  letter-spacing: 1.4px;
+
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 8px 0 16px;
+
+  color: #16323f;
+
+  font-size: clamp(32px, 5vw, 46px);
+
+  line-height: 1.15;
+}
+
+h2 {
+  margin: 0 0 14px;
+
+  font-size: 22px;
+}
+
+p {
+  line-height: 1.6;
+}
+
+/* =========================================
+   WELCOME SCREEN
+   ========================================= */
+
+.welcome-card {
+  max-width: 900px;
+
+  text-align: center;
+
+  padding-top: 55px;
+  padding-bottom: 55px;
+}
+
+.tagline {
+  margin: 0 0 20px;
+
+  color: #087f8c;
+
+  font-size: 21px;
+  font-weight: 700;
+}
+
+.description {
+  max-width: 650px;
+
+  margin: 0 auto 34px;
+
+  color: #55707b;
+
+  font-size: 18px;
+}
+
+.accessibility {
+  display: flex;
+
+  justify-content: center;
+
+  gap: 28px;
+
+  flex-wrap: wrap;
+
+  margin-top: 30px;
+
+  color: #607984;
+
+  font-size: 14px;
+}
+
+.privacy {
+  margin: 24px 0 0;
+
+  color: #71858d;
+
+  font-size: 14px;
+}
+
+/* =========================================
+   PRIMARY BUTTON
+   ========================================= */
+
+.primary-button {
+  min-height: 58px;
+
+  padding: 16px 30px;
+
+  border: none;
+
+  border-radius: 15px;
+
+  background: linear-gradient(
+    135deg,
+    #087f8c,
+    #1769aa
+  );
+
+  color: white;
+
+  font-size: 18px;
+  font-weight: 750;
+
+  box-shadow:
+    0 8px 20px rgba(8, 127, 140, 0.18);
+
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.primary-button:hover {
+  transform: translateY(-2px);
+
+  box-shadow:
+    0 12px 25px rgba(8, 127, 140, 0.25);
+}
+
+.primary-button:active {
+  transform: translateY(0);
+}
+
+.full-width {
+  width: 100%;
+}
+
+/* =========================================
+   SECONDARY BUTTON
+   ========================================= */
+
+.secondary-button {
+  min-height: 54px;
+
+  padding: 14px 24px;
+
+  border: 2px solid #d8e5e9;
+
+  border-radius: 14px;
+
+  background: white;
+
+  color: #36535e;
+
+  font-size: 17px;
+
+  font-weight: 650;
+}
+
+.secondary-button:hover {
+  border-color: #087f8c;
+
+  background: #f5fbfc;
+}
+
+/* =========================================
+   BACK BUTTON
+   ========================================= */
+
+.back-button {
+  display: block;
+
+  margin: 22px auto 0;
+
+  padding: 10px 18px;
+
+  border: none;
+
+  background: transparent;
+
+  color: #087f8c;
+
+  font-size: 16px;
+
+  font-weight: 650;
+}
+
+.back-button:hover {
+  text-decoration: underline;
+}
+
+/* =========================================
+   LANGUAGE SCREEN
+   ========================================= */
+
+.language-card {
+  max-width: 850px;
+
+  text-align: center;
+}
+
+.language-card > p:not(.step-label):not(.privacy) {
+  max-width: 620px;
+
+  margin: 0 auto 32px;
+
+  color: #607984;
+
+  font-size: 18px;
+}
+
+.language-grid {
+  display: grid;
+
+  grid-template-columns: repeat(2, 1fr);
+
+  gap: 16px;
+
+  width: 100%;
+}
+
+.language-grid button {
+  min-height: 72px;
+
+  padding: 18px;
+
+  border: 2px solid #d9e6ea;
+
+  border-radius: 16px;
+
+  background: #ffffff;
+
+  color: #23434e;
+
+  font-size: 21px;
+
+  font-weight: 700;
+
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    transform 0.15s ease;
+}
+
+.language-grid button:hover {
+  border-color: #087f8c;
+
+  background: #f3fbfc;
+
+  transform: translateY(-2px);
+}
+
+/* =========================================
+   CONSENT SCREEN
+   ========================================= */
+
+.consent-card {
+  max-width: 850px;
+}
+
+.consent-box {
+  margin: 25px 0;
+
+  padding: 28px;
+
+  background: #f5fafb;
+
+  border: 1px solid #dcebed;
+
+  border-radius: 18px;
+}
+
+.consent-box p {
+  margin: 12px 0;
+
+  color: #536d76;
+
+  font-size: 16px;
+}
+
+.consent-actions {
+  display: flex;
+
+  align-items: center;
+
+  justify-content: space-between;
+
+  gap: 20px;
+
+  margin-top: 28px;
+}
+
+.consent-actions .primary-button {
+  flex: 1;
+}
+
+.consent-actions .secondary-button {
+  flex-shrink: 0;
+}
+
+/* =========================================
+   PATIENT INFORMATION
+   ========================================= */
+
+.patient-card {
+  max-width: 780px;
+}
+
+.patient-card > p:not(
+  .step-label
+):not(
+  .privacy
+):not(
+  .session-info
+) {
+  color: #607984;
+
+  margin-bottom: 30px;
+}
+
+/* =========================================
+   FORM
+   ========================================= */
+
+.form-group {
+  display: flex;
+
+  flex-direction: column;
+
+  gap: 8px;
+
+  margin-bottom: 20px;
+}
+
+.form-group label {
+  color: #294953;
+
+  font-size: 15px;
+
+  font-weight: 750;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+
+  min-height: 54px;
+
+  padding: 14px 16px;
+
+  border: 2px solid #d9e6ea;
+
+  border-radius: 13px;
+
+  background: white;
+
+  color: #203f49;
+
+  font-size: 17px;
+
+  outline: none;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  border-color: #087f8c;
+
+  box-shadow:
+    0 0 0 4px rgba(8, 127, 140, 0.08);
+}
+
+.form-row {
+  display: grid;
+
+  grid-template-columns: 1fr 1fr;
+
+  gap: 18px;
+}
+
+/* =========================================
+   SESSION MESSAGE
+   ========================================= */
+
+.session-info {
+  margin: 4px 0 20px;
+
+  padding: 12px 16px;
+
+  border-radius: 12px;
+
+  background: #edf8f3;
+
+  color: #26734d;
+
+  font-size: 14px;
+
+  font-weight: 650;
+}
+
+/* =========================================
+   CLINICAL INTERVIEW
+   ========================================= */
+
+.interview-card {
+  max-width: 850px;
+}
+
+.progress-container {
+  width: 100%;
+
+  height: 8px;
+
+  margin: 15px 0 35px;
+
+  overflow: hidden;
+
+  background: #e4eef1;
+
+  border-radius: 20px;
+}
+
+.progress-bar {
+  width: 25%;
+
+  height: 100%;
+
+  background: linear-gradient(
+    90deg,
+    #087f8c,
+    #1769aa
+  );
+
+  border-radius: 20px;
+}
+
+.question {
+  margin: 28px 0;
+
+  color: #203f49;
+
+  font-size: 25px;
+
+  font-weight: 650;
+
+  line-height: 1.45;
+}
+
+/* =========================================
+   VOICE BUTTON
+   ========================================= */
+
+.voice-button {
+  width: 82px;
+  height: 82px;
+
+  display: block;
+
+  margin: 25px auto 12px;
+
+  border: none;
+
+  border-radius: 50%;
+
+  background: linear-gradient(
+    135deg,
+    #087f8c,
+    #1769aa
+  );
+
+  color: white;
+
+  font-size: 30px;
+
+  box-shadow:
+    0 10px 25px rgba(8, 127, 140, 0.22);
+
+  transition: transform 0.15s ease;
+}
+
+.voice-button:hover {
+  transform: scale(1.05);
+}
+
+.voice-hint {
+  text-align: center;
+
+  color: #71858d;
+
+  font-size: 14px;
+}
+
+/* =========================================
+   DIVIDER
+   ========================================= */
+
+.divider {
+  display: flex;
+
+  align-items: center;
+
+  gap: 15px;
+
+  margin: 28px 0;
+
+  color: #8aa0a8;
+
+  font-size: 13px;
+
+  font-weight: 700;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+
+  flex: 1;
+
+  height: 1px;
+
+  background: #dce7ea;
+}
+
+/* =========================================
+   COMPLAINT INPUT
+   ========================================= */
+
+.complaint-input {
+  width: 100%;
+
+  min-height: 58px;
+
+  padding: 16px;
+
+  border: 2px solid #d9e6ea;
+
+  border-radius: 14px;
+
+  font-size: 17px;
+
+  outline: none;
+
+  margin-bottom: 18px;
+}
+
+.complaint-input:focus {
+  border-color: #087f8c;
+
+  box-shadow:
+    0 0 0 4px rgba(8, 127, 140, 0.08);
+}
+
+/* =========================================
+   TABLET / SMALL LAPTOP
+   ========================================= */
+
+@media (max-width: 700px) {
+  .kiosk {
+    padding: 20px 14px;
+
+    align-items: flex-start;
+  }
+
+  .language-card,
+  .welcome-card,
+  .consent-card,
+  .patient-card,
+  .interview-card {
+    padding: 30px 22px;
+
+    border-radius: 22px;
+  }
+
+  h1 {
+    font-size: 32px;
+  }
+
+  .language-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .form-row {
+    grid-template-columns: 1fr;
+
+    gap: 0;
+  }
+
+  .consent-actions {
+    flex-direction: column-reverse;
+  }
+
+  .consent-actions button {
+    width: 100%;
+  }
+
+  .question {
+    font-size: 21px;
+  }
+}
+
+/* =========================================
+   SMALL PHONE
+   ========================================= */
+
+@media (max-width: 420px) {
+  .kiosk {
+    padding: 12px;
+  }
+
+  .language-card,
+  .welcome-card,
+  .consent-card,
+  .patient-card,
+  .interview-card {
+    padding: 24px 18px;
+  }
+
+  .language-grid button {
+    min-height: 60px;
+
+    font-size: 18px;
+  }
+}
+/* ================================
+   DOCTOR CLINICAL REVIEW
+   ================================ */
+
+.doctor-card {
+  width: min(900px, 92vw);
+  max-height: 90vh;
+  overflow-y: auto;
+  margin: 0 auto;
+  padding: 40px;
+  box-sizing: border-box;
+}
+
+.doctor-card h1 {
+  margin-bottom: 10px;
+}
+
+.doctor-subtitle {
+  margin-bottom: 30px;
+  line-height: 1.6;
+}
+
+.summary-section {
+  margin-top: 28px;
+  padding: 24px;
+  border-radius: 16px;
+  border: 1px solid #e5e7eb;
+  background: #ffffff;
+}
+
+.summary-section h2 {
+  margin: 0 0 20px 0;
+  font-size: 20px;
+}
+
+/* Patient information */
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.summary-grid > div {
+  padding: 18px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+}
+
+.summary-grid span {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.summary-grid strong {
+  display: block;
+  font-size: 18px;
+}
+
+/* Chief complaint */
+
+.summary-box {
+  padding: 18px 20px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  font-size: 17px;
+  line-height: 1.6;
+}
+
+/* HPI */
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.history-item {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 20px;
+  align-items: start;
+  padding: 16px 18px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+}
+
+.history-item span {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.history-item strong {
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+/* Completion */
+
+.completion-banner {
+  margin-top: 28px;
+  padding: 16px 20px;
+  border-radius: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.doctor-note {
+  margin: 18px 0 24px;
+  line-height: 1.6;
+}
+
+/* Mobile */
+
+@media (max-width: 700px) {
+  .doctor-card {
+    width: 94vw;
+    padding: 24px;
+  }
+
+  .summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .history-item {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+}
+/* ================================
+   URGENCY / RED-FLAG ASSESSMENT
+   ================================ */
+
+.urgency-section {
+  margin-top: 28px;
+  padding: 24px;
+  border-radius: 16px;
+  border: 1px solid #e5e7eb;
+}
+
+.urgency-section.routine {
+  background: #f8fafc;
+}
+
+.urgency-section.urgent {
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+
+.urgency-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.urgency-icon {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: #ffffff;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.urgency-header h2 {
+  margin: 0 0 5px 0;
+  font-size: 20px;
+}
+
+.urgency-header p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.urgency-message {
+  margin-top: 18px;
+  padding: 16px 18px;
+  border-radius: 12px;
+  background: #ffffff;
+  line-height: 1.6;
+}
+
+.flag-list {
+  margin-top: 18px;
+  padding: 16px 18px;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.flag-item {
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
+@media (max-width: 700px) {
+  .urgency-section {
+    padding: 18px;
+  }
+
+  .urgency-header {
+    align-items: flex-start;
+  }
+}
+/* =========================================
+   MEDIKIOSK PATIENT & DOCTOR PORTALS
+========================================= */
+
+.portal-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  padding: 0;
+}
+
+.portal-header {
+  width: 100%;
+  min-height: 76px;
+  padding: 14px 5%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #e5e7eb;
+  background: #ffffff;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand .logo {
+  margin: 0;
+}
+
+.brand strong {
+  display: block;
+  font-size: 20px;
+}
+
+.brand span {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.header-actions,
+.header-security {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.portal-content {
+  width: min(1180px, 92vw);
+  margin: auto;
+  padding: 50px 0;
+  display: grid;
+  grid-template-columns: 1fr 480px;
+  gap: 70px;
+  align-items: center;
+}
+
+.portal-info {
+  padding: 20px 0;
+}
+
+.portal-icon {
+  width: 64px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 18px;
+  background: #f1f5f9;
+  font-size: 30px;
+  margin-bottom: 24px;
+}
+
+.portal-info h1 {
+  margin: 12px 0 20px;
+  font-size: clamp(34px, 4vw, 52px);
+  line-height: 1.08;
+  letter-spacing: -1px;
+}
+
+.portal-description {
+  max-width: 570px;
+  color: #64748b;
+  font-size: 17px;
+  line-height: 1.7;
+}
+
+.feature-list {
+  margin-top: 34px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.feature-list > div {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.feature-list > div > span {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: #f1f5f9;
+  font-weight: 700;
+}
+
+.feature-list strong {
+  display: block;
+  margin-bottom: 3px;
+}
+
+.feature-list p {
+  margin: 0;
+  color: #64748b;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.portal-login-card {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 34px;
+  border-radius: 22px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  box-shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
+}
+
+.card-heading {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 28px;
+}
+
+.card-icon {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 13px;
+  background: #f1f5f9;
+  font-size: 22px;
+  flex-shrink: 0;
+}
+
+.card-heading h2 {
+  margin: 0 0 4px;
+  font-size: 22px;
+}
+
+.card-heading p {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.portal-login-card .form-group {
+  margin-bottom: 20px;
+}
+
+.portal-login-card label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.portal-login-card input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 14px 15px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  font-size: 15px;
+  outline: none;
+  transition: border 0.2s, box-shadow 0.2s;
+}
+
+.portal-login-card input:focus {
+  border-color: #64748b;
+  box-shadow: 0 0 0 3px rgba(100, 116, 139, 0.12);
+}
+
+.input-help {
+  margin: 7px 0 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.security-box {
+  margin-top: 22px;
+  padding: 15px;
+  display: flex;
+  gap: 12px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.security-box > div:first-child {
+  font-size: 20px;
+}
+
+.security-box strong {
+  display: block;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.security-box p {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.prototype-note {
+  margin-top: 14px;
+  padding: 13px 15px;
+  border-radius: 10px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+}
+
+.prototype-note strong {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.prototype-note p {
+  margin: 0;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.password-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.password-label label {
+  margin-bottom: 8px;
+}
+
+.show-password,
+.forgot-button {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0;
+}
+
+.show-password {
+  color: #475569;
+}
+
+.forgot-button {
+  color: #475569;
+}
+
+.login-options {
+  margin: -2px 0 22px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.remember-option {
+  display: flex !important;
+  align-items: center;
+  gap: 7px;
+  margin: 0 !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  color: #64748b;
+}
+
+.remember-option input {
+  width: auto !important;
+}
+
+.portal-footer {
+  width: 100%;
+  padding: 16px 5%;
+  box-sizing: border-box;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  color: #94a3b8;
+  font-size: 11px;
+  border-top: 1px solid #e5e7eb;
+  background: #ffffff;
+}
+
+/* Mobile */
+
+@media (max-width: 850px) {
+  .portal-header {
+    padding: 14px 5%;
+  }
+
+  .header-actions {
+    display: none;
+  }
+
+  .portal-content {
+    grid-template-columns: 1fr;
+    gap: 25px;
+    padding: 35px 0;
+  }
+
+  .portal-info {
+    text-align: center;
+  }
+
+  .portal-icon {
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .portal-description {
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .feature-list {
+    text-align: left;
+    max-width: 500px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .portal-login-card {
+    width: 100%;
+  }
+}
+
+@media (max-width: 550px) {
+  .portal-login-card {
+    padding: 24px;
+    border-radius: 16px;
+  }
+
+  .portal-info h1 {
+    font-size: 34px;
+  }
+
+  .portal-footer {
+    flex-wrap: wrap;
+    text-align: center;
+  }
+
+  .header-security {
+    display: none;
+  }
+
+  .login-options {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+--------------------------------------------------------------------------------
+index.css 
+
+
+:root {
+  --text: #6b6375;
+  --text-h: #08060d;
+  --bg: #fff;
+  --border: #e5e4e7;
+  --code-bg: #f4f3ec;
+  --accent: #aa3bff;
+  --accent-bg: rgba(170, 59, 255, 0.1);
+  --accent-border: rgba(170, 59, 255, 0.5);
+  --social-bg: rgba(244, 243, 236, 0.5);
+  --shadow:
+    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 18px/145% var(--sans);
+  letter-spacing: 0.18px;
+  color-scheme: light dark;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #9ca3af;
+    --text-h: #f3f4f6;
+    --bg: #16171d;
+    --border: #2e303a;
+    --code-bg: #1f2028;
+    --accent: #c084fc;
+    --accent-bg: rgba(192, 132, 252, 0.15);
+    --accent-border: rgba(192, 132, 252, 0.5);
+    --social-bg: rgba(47, 48, 58, 0.5);
+    --shadow:
+      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+  }
+
+  #social .button-icon {
+    filter: invert(1) brightness(2);
+  }
+}
+
+body {
+  margin: 0;
+}
+
+#root {
+  width: 1126px;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  border-inline: 1px solid var(--border);
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: 56px;
+  letter-spacing: -1.68px;
+  margin: 32px 0;
+  @media (max-width: 1024px) {
+    font-size: 36px;
+    margin: 20px 0;
+  }
+}
+h2 {
+  font-size: 24px;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+p {
+  margin: 0;
+}
+
+code,
+.counter {
+  font-family: var(--mono);
+  display: inline-flex;
+  border-radius: 4px;
+  color: var(--text-h);
+}
+
+code {
+  font-size: 15px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}
+------------------------------------------------------------------------
+main.jsx
+
+
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+------------------------------------------------------------------------------
+index.html
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>frontend</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+-------------------------------------------------------------------------------
