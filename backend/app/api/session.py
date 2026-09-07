@@ -8,6 +8,7 @@ from app.services.session_service import (
     get_session,
     grant_consent,
     update_session,
+    get_completed_sessions,
 )
 
 from app.services.red_flag_engine import detect_red_flags
@@ -107,3 +108,24 @@ def check_red_flags(session_id: str):
     )
 
     return result
+
+@router.get("/doctor/queue")
+def doctor_queue():
+    return {
+        "count": len(get_completed_sessions()),
+        "cases": get_completed_sessions(),
+    }
+
+@router.post("/{session_id}/complete")
+def complete_patient_session(session_id: str):
+    from app.services.session_service import complete_session
+
+    session = complete_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    return session

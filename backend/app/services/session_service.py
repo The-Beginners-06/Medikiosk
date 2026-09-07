@@ -229,3 +229,12 @@ def complete_session(
     session["status"] = "completed"
 
     return session
+
+def get_completed_sessions() -> list[dict[str, Any]]:
+    completed_cases = []
+
+    for session in SESSIONS.values():
+        if session.get("status") == "completed":
+            completed_cases.append(session)
+
+    return completed_cases
