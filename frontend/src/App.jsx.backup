@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import "./App.css";
 
 import PatientLogin from "./pages/PatientLogin";
@@ -30,7 +30,6 @@ function App() {
 
   const [complaint, setComplaint] = useState("");
   const [question, setQuestion] = useState("");
-  const [firstQuestion, setFirstQuestion] = useState("");
   const [field, setField] = useState("");
   const [answer, setAnswer] = useState("");
   const [answers, setAnswers] = useState({});
@@ -60,113 +59,48 @@ const [checkingRedFlags, setCheckingRedFlags] = useState(false);
     return codes[language] || "en-IN";
   }
 
-function speak(text) {
-  if (!text || !window.speechSynthesis) {
-    return;
-  }
-
-  const synth = window.speechSynthesis;
-
-  synth.cancel();
-
-  const languageCode = speechCode();
-
-  const speakNow = () => {
-    const voices = synth.getVoices();
-
-    console.log("TTS language:", languageCode);
-    console.log(
-      "Available voices:",
-      voices.map((voice) => `${voice.name} — ${voice.lang}`)
-    );
-
-    let matchingVoice = voices.find(
-      (voice) => voice.lang.toLowerCase() === languageCode.toLowerCase()
-    );
-
-    if (!matchingVoice) {
-      matchingVoice = voices.find((voice) =>
-        voice.lang
-          .toLowerCase()
-          .startsWith(languageCode.split("-")[0].toLowerCase())
-      );
+  function speak(text) {
+    if (!text || !window.speechSynthesis) {
+      return;
     }
+
+    window.speechSynthesis.cancel();
 
     const message = new SpeechSynthesisUtterance(text);
 
-    message.lang = languageCode;
+    message.lang = speechCode();
     message.rate = 0.85;
     message.pitch = 1;
     message.volume = 1;
 
-    if (matchingVoice) {
-      message.voice = matchingVoice;
-      console.log("Selected TTS voice:", matchingVoice.name);
-    } else {
-      console.warn(
-        `No voice found for ${languageCode}. Browser will use its default voice.`
-      );
-    }
-
     message.onstart = () => {
-      console.log("TTS started:", text);
       setSpeaking(true);
     };
 
     message.onend = () => {
-      console.log("TTS finished");
       setSpeaking(false);
     };
 
-    message.onerror = (event) => {
-      console.error("Speech synthesis error:", event);
+    message.onerror = () => {
       setSpeaking(false);
     };
 
-    synth.speak(message);
-  };
-
-  const voices = synth.getVoices();
-
-  if (voices.length > 0) {
-    speakNow();
-  } else {
-    synth.addEventListener("voiceschanged", speakNow, {
-      once: true,
-    });
-  }
-}
-
-useEffect(() => {
-  if (screen !== "interview" || completed) {
-    return;
+    window.speechSynthesis.speak(message);
   }
 
-  let cancelled = false;
-
-  async function prepareAndSpeakQuestion() {
-    if (question) {
-      speak(question);
+  useEffect(() => {
+    if (screen !== "interview" || completed) {
       return;
     }
 
-    const defaultQuestion =
-      "What is the main problem or symptom you are experiencing today?";
-
-    const translatedQuestion = await translateQuestion(defaultQuestion);
-
-    if (!cancelled) {
-      setFirstQuestion(translatedQuestion);
-      speak(translatedQuestion);
+    if (question) {
+      speak(question);
+    } else {
+      speak(
+        "What is the main problem or symptom you are experiencing today?"
+      );
     }
-  }
-
-  prepareAndSpeakQuestion();
-
-  return () => {
-    cancelled = true;
-  };
-}, [screen, question, completed, language]);
+  }, [screen, question, completed]);
 
   useEffect(() => {
     if (screen !== "interview" && window.speechSynthesis) {
@@ -175,40 +109,6 @@ useEffect(() => {
     }
   }, [screen]);
 
-  async function translateQuestion(text) {
-    if (!text || language === "English") {
-      return text;
-    }
-
-    try {
-      const response = await fetch(
-        `${API}/api/v1/translation/translate`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            text,
-            target_language: language,
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error("Translation request failed");
-      }
-
-      const data = await response.json();
-
-      return data.translated || text;
-    } catch (error) {
-      console.error("Translation error:", error);
-
-      // If translation fails, keep the original clinical question.
-      return text;
-    }
-  }
   async function createSession() {
     try {
       setLoading(true);
@@ -404,11 +304,7 @@ async function startInterview() {
 }
 
       setCompleted(false);
-
-      const originalQuestion = data.question || "";
-      const translatedQuestion = await translateQuestion(originalQuestion);
-
-      setQuestion(translatedQuestion);
+      setQuestion(data.question || "");
       setField(data.field || "");
       setAnswer("");
     } catch (error) {
@@ -1094,9 +990,10 @@ async function startInterview() {
             </div>
           ) : (
             <div>
-<p className="question">
-  {question || firstQuestion || "Loading question..."}
-</p>
+              <p className="question">
+                {question ||
+                  "What is the main problem or symptom you are experiencing today?"}
+              </p>
 
               {speaking && (
                 <div className="speaking-indicator">
@@ -1731,5 +1628,3 @@ async function startInterview() {
 }
 
 export default App;
-
-

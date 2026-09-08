@@ -5,6 +5,8 @@ from app.api.clinical import router as clinical_router
 from app.api.interview import router as interview_router
 from app.api.session import router as session_router
 
+from app.api.translation import router as translation_router
+
 
 app = FastAPI(
     title="MediKiosk API",
@@ -45,3 +47,4 @@ def health_check():
 app.include_router(clinical_router)
 app.include_router(interview_router)
 app.include_router(session_router)
+app.include_router(translation_router)

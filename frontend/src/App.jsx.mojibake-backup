@@ -8,11 +8,11 @@ const API = "http://127.0.0.1:8000";
 
 const languages = [
   ["English", "English"],
-  ["Hindi", "हिन्दी"],
-  ["Marathi", "मराठी"],
-  ["Tamil", "தமிழ்"],
-  ["Telugu", "తెలుగు"],
-  ["Bengali", "বাংলা"],
+  ["Hindi", "à¤¹à¤¿à¤¨à¥à¤¦à¥€"],
+  ["Marathi", "à¤®à¤°à¤¾à¤ à¥€"],
+  ["Tamil", "à®¤à®®à®¿à®´à¯"],
+  ["Telugu", "à°¤à±†à°²à±à°—à±"],
+  ["Bengali", "à¦¬à¦¾à¦‚à¦²à¦¾"],
 ];
 
 function App() {
@@ -30,7 +30,6 @@ function App() {
 
   const [complaint, setComplaint] = useState("");
   const [question, setQuestion] = useState("");
-  const [firstQuestion, setFirstQuestion] = useState("");
   const [field, setField] = useState("");
   const [answer, setAnswer] = useState("");
   const [answers, setAnswers] = useState({});
@@ -60,113 +59,48 @@ const [checkingRedFlags, setCheckingRedFlags] = useState(false);
     return codes[language] || "en-IN";
   }
 
-function speak(text) {
-  if (!text || !window.speechSynthesis) {
-    return;
-  }
-
-  const synth = window.speechSynthesis;
-
-  synth.cancel();
-
-  const languageCode = speechCode();
-
-  const speakNow = () => {
-    const voices = synth.getVoices();
-
-    console.log("TTS language:", languageCode);
-    console.log(
-      "Available voices:",
-      voices.map((voice) => `${voice.name} — ${voice.lang}`)
-    );
-
-    let matchingVoice = voices.find(
-      (voice) => voice.lang.toLowerCase() === languageCode.toLowerCase()
-    );
-
-    if (!matchingVoice) {
-      matchingVoice = voices.find((voice) =>
-        voice.lang
-          .toLowerCase()
-          .startsWith(languageCode.split("-")[0].toLowerCase())
-      );
+  function speak(text) {
+    if (!text || !window.speechSynthesis) {
+      return;
     }
+
+    window.speechSynthesis.cancel();
 
     const message = new SpeechSynthesisUtterance(text);
 
-    message.lang = languageCode;
+    message.lang = speechCode();
     message.rate = 0.85;
     message.pitch = 1;
     message.volume = 1;
 
-    if (matchingVoice) {
-      message.voice = matchingVoice;
-      console.log("Selected TTS voice:", matchingVoice.name);
-    } else {
-      console.warn(
-        `No voice found for ${languageCode}. Browser will use its default voice.`
-      );
-    }
-
     message.onstart = () => {
-      console.log("TTS started:", text);
       setSpeaking(true);
     };
 
     message.onend = () => {
-      console.log("TTS finished");
       setSpeaking(false);
     };
 
-    message.onerror = (event) => {
-      console.error("Speech synthesis error:", event);
+    message.onerror = () => {
       setSpeaking(false);
     };
 
-    synth.speak(message);
-  };
-
-  const voices = synth.getVoices();
-
-  if (voices.length > 0) {
-    speakNow();
-  } else {
-    synth.addEventListener("voiceschanged", speakNow, {
-      once: true,
-    });
-  }
-}
-
-useEffect(() => {
-  if (screen !== "interview" || completed) {
-    return;
+    window.speechSynthesis.speak(message);
   }
 
-  let cancelled = false;
-
-  async function prepareAndSpeakQuestion() {
-    if (question) {
-      speak(question);
+  useEffect(() => {
+    if (screen !== "interview" || completed) {
       return;
     }
 
-    const defaultQuestion =
-      "What is the main problem or symptom you are experiencing today?";
-
-    const translatedQuestion = await translateQuestion(defaultQuestion);
-
-    if (!cancelled) {
-      setFirstQuestion(translatedQuestion);
-      speak(translatedQuestion);
+    if (question) {
+      speak(question);
+    } else {
+      speak(
+        "What is the main problem or symptom you are experiencing today?"
+      );
     }
-  }
-
-  prepareAndSpeakQuestion();
-
-  return () => {
-    cancelled = true;
-  };
-}, [screen, question, completed, language]);
+  }, [screen, question, completed]);
 
   useEffect(() => {
     if (screen !== "interview" && window.speechSynthesis) {
@@ -730,7 +664,7 @@ async function startInterview() {
           </div>
 
           <p className="privacy">
-            🌐 Your selected language will be used throughout the
+            ðŸŒ Your selected language will be used throughout the
             clinical intake.
           </p>
         </div>
@@ -771,7 +705,7 @@ async function startInterview() {
             className="primary-button full-width"
             onClick={() => setScreen("patientLogin")}
           >
-            👤 Patient Portal →
+            ðŸ‘¤ Patient Portal â†’
           </button>
 
           <button
@@ -779,21 +713,21 @@ async function startInterview() {
             style={{ marginTop: "12px" }}
             onClick={() => setScreen("doctorLogin")}
           >
-            🩺 Doctor Portal →
+            ðŸ©º Doctor Portal â†’
           </button>
 
           <div className="accessibility">
-            <span>🎤 Voice enabled</span>
-            <span>🔊 Questions read aloud</span>
-            <span>👆 Touch enabled</span>
-            <span>🔒 Secure</span>
+            <span>ðŸŽ¤ Voice enabled</span>
+            <span>ðŸ”Š Questions read aloud</span>
+            <span>ðŸ‘† Touch enabled</span>
+            <span>ðŸ”’ Secure</span>
           </div>
 
           <button
             className="back-button"
             onClick={() => setScreen("language")}
           >
-            ← Change Language
+            â† Change Language
           </button>
         </div>
       </div>
@@ -879,7 +813,7 @@ async function startInterview() {
             className="primary-button full-width"
             onClick={() => setScreen("consent")}
           >
-            Start Clinical Intake →
+            Start Clinical Intake â†’
           </button>
 
           <button
@@ -930,7 +864,7 @@ async function startInterview() {
               className="secondary-button"
               onClick={() => setScreen("patientPortal")}
             >
-              ← Back
+              â† Back
             </button>
 
             <button
@@ -940,12 +874,12 @@ async function startInterview() {
             >
               {loading
                 ? "Creating Session..."
-                : "I Understand & Continue →"}
+                : "I Understand & Continue â†’"}
             </button>
           </div>
 
           <p className="privacy">
-            🔒 Your information is collected with your consent.
+            ðŸ”’ Your information is collected with your consent.
           </p>
         </div>
       </div>
@@ -1019,7 +953,7 @@ async function startInterview() {
 
           {sessionId && (
             <p className="session-info">
-              ✓ Session created successfully
+              âœ“ Session created successfully
             </p>
           )}
 
@@ -1027,7 +961,7 @@ async function startInterview() {
             className="primary-button full-width"
             onClick={startInterview}
           >
-            Continue to Clinical Interview →
+            Continue to Clinical Interview â†’
           </button>
         </div>
       </div>
@@ -1061,7 +995,7 @@ async function startInterview() {
 
           {completed ? (
             <div className="completion-screen">
-              <div className="completion-icon">✓</div>
+              <div className="completion-icon">âœ“</div>
 
               <h2>Clinical Interview Complete</h2>
 
@@ -1089,18 +1023,19 @@ async function startInterview() {
               >
                 {checkingRedFlags
                   ? "Completing Assessment..."
-                  : "Continue to Doctor Review →"}
+                  : "Continue to Doctor Review â†’"}
               </button>
             </div>
           ) : (
             <div>
-<p className="question">
-  {question || firstQuestion || "Loading question..."}
-</p>
+              <p className="question">
+                {question ||
+                  "What is the main problem or symptom you are experiencing today?"}
+              </p>
 
               {speaking && (
                 <div className="speaking-indicator">
-                  🔊 Reading question aloud...
+                  ðŸ”Š Reading question aloud...
                 </div>
               )}
 
@@ -1112,7 +1047,7 @@ async function startInterview() {
                 }
                 onClick={voiceInput}
               >
-                {listening ? "🔴" : "🎤"}
+                {listening ? "ðŸ”´" : "ðŸŽ¤"}
               </button>
 
               <p className="voice-hint">
@@ -1152,7 +1087,7 @@ async function startInterview() {
                 }
                 disabled={loading}
               >
-                {loading ? "Please wait..." : "Continue →"}
+                {loading ? "Please wait..." : "Continue â†’"}
               </button>
             </div>
           )}
@@ -1183,7 +1118,7 @@ async function startInterview() {
             </div>
 
             <div className="review-status">
-              ✓ Authorized
+              âœ“ Authorized
             </div>
           </div>
 
@@ -1254,7 +1189,7 @@ async function startInterview() {
               className="primary-button"
               onClick={() => openDoctorCase(patientCase)}
             >
-              Open Case →
+              Open Case â†’
             </button>
           </div>
         </div>
@@ -1341,7 +1276,7 @@ async function startInterview() {
               className="primary-button full-width"
               onClick={() => setScreen("doctorDashboard")}
             >
-              ← Back to Patient Queue
+              â† Back to Patient Queue
             </button>
           </div>
         </div>
@@ -1373,10 +1308,10 @@ async function startInterview() {
 
             <div className="review-status">
               {caseStatus === "reviewed"
-                ? "✓ Reviewed"
+                ? "âœ“ Reviewed"
                 : caseStatus === "in_review"
-                ? "● In Review"
-                : "● Waiting"}
+                ? "â— In Review"
+                : "â— Waiting"}
             </div>
           </div>
 
@@ -1441,7 +1376,7 @@ async function startInterview() {
               >
                 <div className="urgency-header">
                   <div className="urgency-icon">
-                    {caseRedFlagResult.has_red_flags ? "⚠️" : "✓"}
+                    {caseRedFlagResult.has_red_flags ? "âš ï¸" : "âœ“"}
                   </div>
 
                   <div>
@@ -1476,7 +1411,7 @@ async function startInterview() {
                         <strong>{flag.type || "Warning"}</strong>
 
                         {flag.severity && (
-                          <span> — Severity: {flag.severity}</span>
+                          <span> â€” Severity: {flag.severity}</span>
                         )}
 
                         {flag.message && (
@@ -1526,7 +1461,7 @@ async function startInterview() {
           </div>
 
           <div className="completion-banner">
-            ⚕️ This is a clinical decision-support prototype.
+            âš•ï¸ This is a clinical decision-support prototype.
             The final diagnosis and treatment decision must be made
             by a qualified healthcare professional.
           </div>
@@ -1536,7 +1471,7 @@ async function startInterview() {
               className="secondary-button"
               onClick={() => setScreen("doctorDashboard")}
             >
-              ← Back to Queue
+              â† Back to Queue
             </button>
 
             <button
@@ -1545,7 +1480,7 @@ async function startInterview() {
               disabled={caseStatus === "reviewed"}
             >
               {caseStatus === "reviewed"
-                ? "✓ Case Reviewed"
+                ? "âœ“ Case Reviewed"
                 : "Mark as Reviewed"}
             </button>
           </div>
@@ -1575,7 +1510,7 @@ async function startInterview() {
             </div>
 
             <div className="review-status">
-              ✓ Complete
+              âœ“ Complete
             </div>
           </div>
 
@@ -1590,7 +1525,7 @@ async function startInterview() {
           >
             <div className="urgency-header">
               <div className="urgency-icon">
-                {redFlagResult?.has_red_flags ? "⚠️" : "✓"}
+                {redFlagResult?.has_red_flags ? "âš ï¸" : "âœ“"}
               </div>
 
               <div>
@@ -1629,7 +1564,7 @@ async function startInterview() {
         {flag.severity && (
           <span>
             {" "}
-            — Severity: {flag.severity}
+            â€” Severity: {flag.severity}
           </span>
         )}
 
@@ -1711,7 +1646,7 @@ async function startInterview() {
           {/* DISCLAIMER */}
 
           <div className="completion-banner">
-            ⚕️ This is a clinical decision-support prototype.
+            âš•ï¸ This is a clinical decision-support prototype.
             The final diagnosis and treatment decision must be made
             by a qualified healthcare professional.
           </div>
@@ -1720,7 +1655,7 @@ async function startInterview() {
             className="primary-button full-width"
             onClick={startNewPatient}
           >
-            Start New Patient →
+            Start New Patient â†’
           </button>
         </div>
       </div>
@@ -1731,5 +1666,4 @@ async function startInterview() {
 }
 
 export default App;
-
 
