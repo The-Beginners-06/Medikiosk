@@ -118,6 +118,7 @@ h1 {
 }
 
 h2 {
+  color: #000;
   margin: 0 0 14px;
   font-size: 22px;
 }
@@ -731,7 +732,7 @@ h1 {
 
 h2 {
   margin: 0 0 14px;
-
+  color: #000;
   font-size: 22px;
 }
 
@@ -1358,6 +1359,7 @@ p {
 }
 
 .summary-section h2 {
+  color: #000;
   margin: 0 0 20px 0;
   font-size: 20px;
 }
@@ -1503,6 +1505,7 @@ p {
 
 .urgency-header h2 {
   margin: 0 0 5px 0;
+  color: #000;
   font-size: 20px;
 }
 
@@ -1704,6 +1707,7 @@ p {
 }
 
 .card-heading h2 {
+  color: #000;
   margin: 0 0 4px;
   font-size: 22px;
 }
