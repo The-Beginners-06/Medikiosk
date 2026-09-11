@@ -29,7 +29,7 @@ router = APIRouter(
 
 class CreateSessionRequest(BaseModel):
     language: str = "English"
-
+    patient_id: str | None = None
 
 class ConsentRequest(BaseModel):
     purposes: list[str]
@@ -56,10 +56,11 @@ class ReviewStatusRequest(BaseModel):
 # -------------------------------------------------------------------
 
 @router.post("")
-def create_patient_session(
-    request: CreateSessionRequest,
-):
-    return create_session(request.language)
+def create_patient_session(request: CreateSessionRequest):
+    return create_session(
+        language=request.language,
+        patient_id=request.patient_id,
+    )
 
 
 # -------------------------------------------------------------------

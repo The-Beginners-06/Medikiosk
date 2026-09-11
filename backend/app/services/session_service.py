@@ -36,7 +36,10 @@ SESSIONS: dict[str, dict[str, Any]] = {}
 # CREATE SESSION
 # -------------------------------------------------------------------
 
-def create_session(language: str = "English") -> dict[str, Any]:
+def create_session(
+    language: str = "English",
+    patient_id: str | None = None,
+) -> dict[str, Any]:
     """
     Create a new MediKiosk patient session.
     """
@@ -45,8 +48,8 @@ def create_session(language: str = "English") -> dict[str, Any]:
 
     session = {
         "session_id": session_id,
-
-        "language": language,
+"patient_id": patient_id,
+"language": language,
 
         "consent": {
             "granted": False,

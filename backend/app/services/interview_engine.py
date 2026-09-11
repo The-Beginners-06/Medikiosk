@@ -4,12 +4,6 @@ from typing import Any
 # -------------------------------------------------------------------
 # MediKiosk Adaptive Clinical Interview Engine
 # -------------------------------------------------------------------
-# The engine uses controlled clinical pathways.
-# It does NOT diagnose the patient.
-# It determines which history information is still missing
-# and selects the next appropriate intake question.
-# -------------------------------------------------------------------
-
 
 QUESTION_PATHWAYS = {
     "chest_pain": {
@@ -27,27 +21,43 @@ QUESTION_PATHWAYS = {
             },
             {
                 "field": "character",
-                "question": "How would you describe the pain, for example pressure, burning, stabbing, or tightness?",
+                "question": (
+                    "How would you describe the pain, for example "
+                    "pressure, burning, stabbing, or tightness?"
+                ),
                 "category": "HPI",
             },
             {
                 "field": "radiation",
-                "question": "Does the pain spread to another part of your body, such as your arm, shoulder, jaw, back, or neck?",
+                "question": (
+                    "Does the pain spread to another part of your body, "
+                    "such as your arm, shoulder, jaw, back, or neck?"
+                ),
                 "category": "HPI",
             },
             {
                 "field": "aggravating_factors",
-                "question": "Does anything make the pain worse, such as walking, breathing, eating, or movement?",
+                "question": (
+                    "Does anything make the pain worse, such as walking, "
+                    "breathing, eating, or movement?"
+                ),
                 "category": "HPI",
             },
             {
                 "field": "relieving_factors",
-                "question": "Does anything make the pain better, such as resting or changing position?",
+                "question": (
+                    "Does anything make the pain better, such as resting "
+                    "or changing position?"
+                ),
                 "category": "HPI",
             },
             {
                 "field": "associated_symptoms",
-                "question": "Are you experiencing any other symptoms along with the chest pain, such as breathlessness, sweating, nausea, dizziness, or palpitations?",
+                "question": (
+                    "Are you experiencing any other symptoms along with "
+                    "the chest pain, such as breathlessness, sweating, "
+                    "nausea, dizziness, or palpitations?"
+                ),
                 "category": "HPI",
             },
             {
@@ -78,7 +88,10 @@ QUESTION_PATHWAYS = {
             },
             {
                 "field": "associated_symptoms",
-                "question": "Are you experiencing any other symptoms along with the fever?",
+                "question": (
+                    "Are you experiencing any other symptoms along with "
+                    "the fever?"
+                ),
                 "category": "HPI",
             },
             {
@@ -119,7 +132,10 @@ QUESTION_PATHWAYS = {
             },
             {
                 "field": "associated_symptoms",
-                "question": "Do you have any other symptoms such as vomiting, diarrhoea, constipation, or loss of appetite?",
+                "question": (
+                    "Do you have any other symptoms such as vomiting, "
+                    "diarrhoea, constipation, or loss of appetite?"
+                ),
                 "category": "HPI",
             },
         ],
@@ -150,7 +166,10 @@ QUESTION_PATHWAYS = {
             },
             {
                 "field": "associated_symptoms",
-                "question": "Do you have any other symptoms such as vomiting, vision changes, weakness, dizziness, or sensitivity to light?",
+                "question": (
+                    "Do you have any other symptoms such as vomiting, "
+                    "vision changes, weakness, dizziness, or sensitivity to light?"
+                ),
                 "category": "HPI",
             },
             {
@@ -165,33 +184,68 @@ QUESTION_PATHWAYS = {
 
 def normalize_complaint(complaint: str) -> str:
     """
-    Convert a patient's chief complaint into a supported
-    internal pathway identifier.
-
-    This is intentionally simple for the first engine version.
-    A later NLP layer can improve this without changing
-    the clinical pathway architecture.
+    Match common English and supported Indian-language symptom wording
+    to a language-neutral interview pathway.
     """
 
-    text = complaint.lower().strip()
+    text = complaint.casefold().strip()
 
-    aliases = {
-        "chest pain": "chest_pain",
-        "pain in chest": "chest_pain",
-        "chest discomfort": "chest_pain",
-
-        "fever": "fever",
-        "high temperature": "fever",
-
-        "abdominal pain": "abdominal_pain",
-        "stomach pain": "abdominal_pain",
-        "belly pain": "abdominal_pain",
-
-        "headache": "headache",
-        "head pain": "headache",
+    keyword_pathways = {
+        "chest_pain": (
+            "chest pain",
+            "pain in chest",
+            "chest discomfort",
+            "सीने में दर्द",
+            "छाती में दर्द",
+            "छातीत दुखणे",
+            "छातीत वेदना",
+            "বুকে ব্যথা",
+            "மார்பு வலி",
+            "ఛాతీ నొప్పి",
+        ),
+        "fever": (
+            "fever",
+            "high temperature",
+            "बुखार",
+            "ताप",
+            "ताप आला",
+            "জ্বর",
+            "காய்ச்சல்",
+            "జ్వరం",
+        ),
+        "abdominal_pain": (
+            "abdominal pain",
+            "stomach pain",
+            "belly pain",
+            "पेट में दर्द",
+            "पेट दर्द",
+            "पोटदुखी",
+            "पोटात दुखणे",
+            "পেট ব্যথা",
+            "வயிற்று வலி",
+            "కడుపు నొప్పి",
+        ),
+        "headache": (
+            "headache",
+            "head pain",
+            "सिरदर्द",
+            "सिर में दर्द",
+            "सर में दर्द",
+            "डोकेदुखी",
+            "डोक्यात दुखत आहे",
+            "মাথা ব্যথা",
+            "தலைவலி",
+            "தலையில் வலி",
+            "తలనొప్పి",
+            "తల నొప్పి",
+        ),
     }
 
-    return aliases.get(text, "general")
+    for pathway_key, keywords in keyword_pathways.items():
+        if any(keyword in text for keyword in keywords):
+            return pathway_key
+
+    return "general"
 
 
 def get_next_question(
@@ -199,26 +253,28 @@ def get_next_question(
     answers: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Determine the next missing question for a complaint.
-
-    Returns:
-        {
-            "completed": bool,
-            "question": str | None,
-            "field": str | None,
-            "category": str | None,
-            "pathway": str
-        }
+    Return the next unanswered clinical interview question.
     """
 
     pathway_key = normalize_complaint(complaint)
 
+    # Unsupported symptom: ask once, save the description, then complete.
+    # This prevents the same general question from repeating forever.
     if pathway_key == "general":
+        free_text = answers.get("free_text")
+
+        if isinstance(free_text, str) and free_text.strip():
+            return {
+                "completed": True,
+                "question": None,
+                "field": None,
+                "category": None,
+                "pathway": "general",
+            }
+
         return {
             "completed": False,
-            "question": (
-                "Please describe your main problem in your own words."
-            ),
+            "question": "Please describe your main problem in your own words.",
             "field": "free_text",
             "category": "Chief Complaint",
             "pathway": "general",
